@@ -12,9 +12,20 @@
 
 ---
 
+## 所需信息的来源
+
+你的 System Prompt 中有一个 `## Platform Agent API` 部分，其中包含：
+
+1. **你的 Token Key** — 形如 `clw_xxxxxxxx`，用于 API 认证
+2. **完整的 API 地址** — 形如 `POST https://xxx/api/v1/agent/chat`
+
+直接从该部分复制使用即可，**不要自己拼接地址**。
+
+---
+
 ## 如何获取目标 Agent 的 ID
 
-你的 **关系网络**（System Prompt 中的 `## Relationships` 部分）会列出所有可调用的数字员工同事，每个条目包含：
+你的 System Prompt 中的 `## Relationships` → `🤖 数字员工同事` 部分列出了所有可调用的 Agent：
 
 ```
 ### 小助手 — 数据分析助手
@@ -30,8 +41,8 @@
 
 ### 基本信息
 
-- **接口地址：** `POST {API_BASE_URL}/api/v1/agent/chat`
-- **认证方式：** Bearer Token（使用你的 Token Key，已在 System Prompt 中提供）
+- **接口地址和 Token Key：** 见你的 System Prompt 中的 `## Platform Agent API` 部分
+- **认证方式：** `Authorization: Bearer <你的Token Key>`
 - **超时时间：** 最长 1 小时
 
 ### Python 代码示例
@@ -39,14 +50,15 @@
 ```python
 import requests
 
-# 你的 Token Key（从 System Prompt 中的 "Platform Agent API" 部分获取）
+# ↓ 从你的 System Prompt "Platform Agent API" 部分获取这两个值
 TOKEN_KEY = "clw_你的token_key"
+API_URL = "https://你的平台地址/api/v1/agent/chat"
 
-# 目标 Agent 的 ID（从关系网络中获取）
+# ↓ 从你的关系网络中获取目标 Agent ID
 TARGET_AGENT_ID = "目标agent的uuid"
 
 response = requests.post(
-    "{API_BASE_URL}/api/v1/agent/chat",
+    API_URL,
     headers={
         "Authorization": f"Bearer {TOKEN_KEY}",
         "Content-Type": "application/json",
@@ -69,8 +81,10 @@ print(reply)
 import requests
 from concurrent.futures import ThreadPoolExecutor
 
+# 从 System Prompt 获取
 TOKEN_KEY = "clw_你的token_key"
-API_URL = "{API_BASE_URL}/api/v1/agent/chat"
+API_URL = "https://你的平台地址/api/v1/agent/chat"
+
 HEADERS = {
     "Authorization": f"Bearer {TOKEN_KEY}",
     "Content-Type": "application/json",
@@ -131,6 +145,7 @@ else:
 
 ## What NOT to Do
 
+- 不要自己拼接 API 地址，从 System Prompt 的 `Platform Agent API` 部分直接获取
 - 不要硬编码 Agent ID，从你的关系网络中动态获取
 - 不要调用不在你关系列表中的 Agent，会返回 403
 - 不要在日志或回复中暴露你的 Token Key
