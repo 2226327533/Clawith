@@ -847,6 +847,16 @@ Until then, structured web search is the contract.
             },
         ],
     },
+    # ─── Agent API Calling (default — enables cross-agent delegation via code) ───
+    {
+        "name": "Agent API Calling",
+        "description": "通过代码调用平台 API 与其他 Agent 协作。包含获取目标 Agent ID、认证方式、Python 代码示例和错误处理。",
+        "category": "development",
+        "icon": "🔗",
+        "folder_name": "agent-api-calling",
+        "is_default": True,
+        "files": [],  # populated at runtime from agent_template/skills/agent-api-calling/SKILL.md
+    },
 ]
 
 
@@ -873,6 +883,12 @@ async def seed_skills():
                 s["files"] = [{"path": "SKILL.md", "content": mcp_file.read_text(encoding="utf-8")}]
             else:
                 logger.warning("[SkillSeeder] mcp-installer/SKILL.md not found in agent_template/skills/")
+        elif s["folder_name"] == "agent-api-calling" and not s["files"]:
+            api_file = _template_skills_dir / "agent-api-calling" / "SKILL.md"
+            if api_file.exists():
+                s["files"] = [{"path": "SKILL.md", "content": api_file.read_text(encoding="utf-8")}]
+            else:
+                logger.warning("[SkillSeeder] agent-api-calling/SKILL.md not found in agent_template/skills/")
 
     async with async_session() as db:
         for skill_data in BUILTIN_SKILLS:
