@@ -146,7 +146,6 @@ else:
 ## What NOT to Do
 
 - 不要自己拼接 API 地址，从 System Prompt 的 `Platform Agent API` 部分直接获取
-- 不要硬编码 Agent ID，从你的关系网络中动态获取
 - 不要调用不在你关系列表中的 Agent，会返回 403
 - 不要在日志或回复中暴露你的 Token Key
 - 不要设置过短的超时时间，复杂任务可能需要较长处理时间
