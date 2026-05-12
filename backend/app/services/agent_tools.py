@@ -241,7 +241,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read file contents from the workspace. Can read soul.md for personality, memory/memory.md for memory, skills/ for skill files, and enterprise_info/ for shared company info. Focus is not stored in files; use list_focus_items and upsert_focus_item for Focus. Use offset and limit for reading large files in chunks.",
+            "description": "Read file contents from the workspace. Can read soul.md for personality, memory/memory.md for memory, skills/ for skill files, and enterprise_info/ for shared company info. Focus is not stored in files; use list_focus_items and upsert_focus_item for Focus. Use offset and limit for reading large files in chunks.\n\nUSAGE TIPS:\n1. Always read a file BEFORE editing it with edit_file, to ensure you have the exact content for old_string matching.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -329,7 +329,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Create or fully overwrite a file in the workspace. Use this when writing a new file or replacing the entire content. For targeted edits to an existing file (change one section without rewriting everything), prefer edit_file instead. Before creating a new document under workspace/, first inspect the relevant directories with list_files, prefer an existing topical subfolder (for example workspace/reports/, workspace/knowledge_base/, workspace/research/) over the workspace root, and create a new subfolder when the content belongs to a new category. Avoid placing standalone document files directly in workspace/ root unless the user explicitly wants that. Can update memory/memory.md, task_history.md, create documents in workspace/, create skills in skills/. Focus is managed with Focus tools, not files. enterprise_info/ is shared company context and is read-only for agents.",
+            "description": "Create or fully overwrite a file in the workspace. Use this when writing a new file or replacing the entire content.\n\nIMPORTANT RULES:\n1. If you only need to modify part of an existing file (e.g. fixing a bug), use `edit_file` instead — do NOT rewrite the entire file.\n2. Before creating a new document under workspace/, first inspect the relevant directories with list_files. Prefer an existing topical subfolder (for example workspace/reports/, workspace/knowledge_base/, workspace/research/) over the workspace root.\n3. Avoid placing standalone document files directly in workspace/ root unless the user explicitly wants that.\n4. Can update memory/memory.md, task_history.md, create documents in workspace/, create skills in skills/.\n5. Focus is managed with Focus tools, not files. enterprise_info/ is shared company context and is read-only for agents.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -393,7 +393,7 @@ AGENT_TOOLS = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "Surgically replace a specific string inside an existing file without rewriting the whole content. Prefer this over write_file when you only need to change one or more sections — it avoids accidentally overwriting content outside the edit target and is safer in multi-agent scenarios. enterprise_info/ is shared company context and is read-only for agents. The old_string must match exactly (including all whitespace and newlines).",
+            "description": "Surgically replace a specific string inside an existing file without rewriting the whole content.\n\nCRITICAL RULES:\n1. The old_string MUST EXACTLY MATCH the text in the file, including all leading whitespace, newlines, and indentation. Even one space difference will cause failure.\n2. Always use `read_file` first to see the exact current content before editing.\n3. Prefer this over write_file when you only need to change one or more sections — it avoids accidentally overwriting content outside the edit target and is safer in multi-agent scenarios.\n4. enterprise_info/ is shared company context and is read-only for agents.",
             "parameters": {
                 "type": "object",
                 "properties": {
