@@ -277,4 +277,4 @@ async def regenerate_token_key(
 
     logger.info(f"[AgentAPI] Token key regenerated for agent {agent.name} ({agent_id})")
 
-    return {"token_key": key, "token_key_suffix": suffix}
+    return {"token_key_suffix": suffix}

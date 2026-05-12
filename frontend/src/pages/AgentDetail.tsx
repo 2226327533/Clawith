@@ -52,7 +52,6 @@ import {
     IconBolt,
     IconAlertTriangle,
     IconKey,
-    IconCopy,
     IconRefresh,
 } from '@tabler/icons-react';
 import { useDropZone } from '../hooks/useDropZone';
@@ -8116,38 +8115,22 @@ function AgentDetailInner() {
                                     const TokenKeyCard = () => {
                                         const isChinese = i18n.language?.startsWith('zh');
                                         const tokenSuffix = (agent as any)?.token_key_suffix;
-                                        const [tokenKeyCopied, setTokenKeyCopied] = useState(false);
                                         const [tokenKeyRegenConfirm, setTokenKeyRegenConfirm] = useState(false);
                                         const [tokenKeyRegening, setTokenKeyRegening] = useState(false);
+                                        const [tokenKeyGenerated, setTokenKeyGenerated] = useState(false);
 
-                                        const copyTokenKey = async () => {
-                                            try {
-                                                const res = await fetchAuth<{ token_key: string }>(`/v1/agent/token-key/${id}`);
-                                                if (res.token_key) {
-                                                    await navigator.clipboard.writeText(res.token_key);
-                                                    setTokenKeyCopied(true);
-                                                    setTimeout(() => setTokenKeyCopied(false), 2000);
-                                                }
-                                            } catch (e: any) {
-                                                alert(e?.message || 'Failed to get token key');
-                                            }
-                                        };
-
-                                        const regenTokenKey = async () => {
+                                        const generateOrRegenTokenKey = async () => {
                                             setTokenKeyRegening(true);
                                             try {
-                                                const res = await fetchAuth<{ token_key: string; token_key_suffix: string }>(
+                                                await fetchAuth<{ token_key_suffix: string }>(
                                                     `/v1/agent/regenerate-token-key/${id}`,
                                                     { method: 'POST' },
                                                 );
-                                                if (res.token_key) {
-                                                    await navigator.clipboard.writeText(res.token_key);
-                                                    queryClient.invalidateQueries({ queryKey: ['agent', id] });
-                                                    setTokenKeyCopied(true);
-                                                    setTimeout(() => setTokenKeyCopied(false), 3000);
-                                                }
+                                                queryClient.invalidateQueries({ queryKey: ['agent', id] });
+                                                setTokenKeyGenerated(true);
+                                                setTimeout(() => setTokenKeyGenerated(false), 2000);
                                             } catch (e: any) {
-                                                alert(e?.message || 'Failed to regenerate');
+                                                alert(e?.message || (isChinese ? '操作失败' : 'Operation failed'));
                                             } finally {
                                                 setTokenKeyRegening(false);
                                                 setTokenKeyRegenConfirm(false);
@@ -8162,8 +8145,8 @@ function AgentDetailInner() {
                                                 </h4>
                                                 <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', marginBottom: '12px' }}>
                                                     {isChinese
-                                                        ? '用于通过平台统一 API 调用其他 Agent。Agent 可以在代码中使用此 Key 进行跨 Agent 协作。'
-                                                        : 'Used for calling other agents via the platform unified API. The agent can use this key in code for cross-agent collaboration.'}
+                                                        ? 'Agent 通过 System Prompt 自动获得此 Key，用于调用平台 API 与其他 Agent 协作。Key 不可查看，仅 Agent 自身可使用。'
+                                                        : 'The agent receives this key automatically via System Prompt for cross-agent API calls. The key is not viewable — only the agent itself can use it.'}
                                                 </p>
                                                 <div style={{
                                                     display: 'flex', alignItems: 'center', gap: '10px',
@@ -8176,49 +8159,41 @@ function AgentDetailInner() {
                                                         letterSpacing: '0.5px',
                                                     }}>
                                                         {tokenSuffix
-                                                            ? `clw_••••••••••••••••••••••••••••${tokenSuffix}`
+                                                            ? `clw_••••••••••••${tokenSuffix}`
                                                             : (isChinese ? '未生成' : 'Not generated')}
                                                     </code>
-                                                    {tokenSuffix && (
-                                                        <>
-                                                            <button
-                                                                className="btn btn-ghost"
-                                                                onClick={copyTokenKey}
-                                                                style={{ padding: '4px 10px', fontSize: '12px' }}
-                                                                title={isChinese ? '复制完整 Key' : 'Copy full key'}
-                                                            >
-                                                                <IconCopy size={14} stroke={1.8} />
-                                                                {tokenKeyCopied
-                                                                    ? (isChinese ? ' 已复制' : ' Copied')
-                                                                    : (isChinese ? ' 复制' : ' Copy')}
-                                                            </button>
-                                                            {!tokenKeyRegenConfirm ? (
-                                                                <button
-                                                                    className="btn btn-ghost"
-                                                                    onClick={() => setTokenKeyRegenConfirm(true)}
-                                                                    style={{ padding: '4px 10px', fontSize: '12px', color: 'var(--warning)' }}
-                                                                    title={isChinese ? '重新生成（旧 Key 将失效）' : 'Regenerate (old key will be invalidated)'}
-                                                                >
-                                                                    <IconRefresh size={14} stroke={1.8} />
-                                                                </button>
-                                                            ) : (
-                                                                <button
-                                                                    className="btn btn-danger"
-                                                                    onClick={regenTokenKey}
-                                                                    disabled={tokenKeyRegening}
-                                                                    style={{ padding: '4px 10px', fontSize: '12px' }}
-                                                                >
-                                                                    {tokenKeyRegening
-                                                                        ? '...'
-                                                                        : (isChinese ? '确认重新生成' : 'Confirm Regenerate')}
-                                                                </button>
-                                                            )}
-                                                        </>
+                                                    {tokenKeyGenerated && (
+                                                        <span style={{ fontSize: '12px', color: 'var(--success)' }}>
+                                                            ✓ {isChinese ? '已生成' : 'Generated'}
+                                                        </span>
+                                                    )}
+                                                    {tokenSuffix && !tokenKeyRegenConfirm && (
+                                                        <button
+                                                            className="btn btn-ghost"
+                                                            onClick={() => setTokenKeyRegenConfirm(true)}
+                                                            style={{ padding: '4px 10px', fontSize: '12px', color: 'var(--warning)' }}
+                                                            title={isChinese ? '重新生成（旧 Key 将失效）' : 'Regenerate (old key will be invalidated)'}
+                                                        >
+                                                            <IconRefresh size={14} stroke={1.8} />
+                                                            {isChinese ? ' 重新生成' : ' Regenerate'}
+                                                        </button>
+                                                    )}
+                                                    {tokenSuffix && tokenKeyRegenConfirm && (
+                                                        <button
+                                                            className="btn btn-danger"
+                                                            onClick={generateOrRegenTokenKey}
+                                                            disabled={tokenKeyRegening}
+                                                            style={{ padding: '4px 10px', fontSize: '12px' }}
+                                                        >
+                                                            {tokenKeyRegening
+                                                                ? '...'
+                                                                : (isChinese ? '确认重新生成' : 'Confirm Regenerate')}
+                                                        </button>
                                                     )}
                                                     {!tokenSuffix && (
                                                         <button
                                                             className="btn btn-primary"
-                                                            onClick={copyTokenKey}
+                                                            onClick={generateOrRegenTokenKey}
                                                             disabled={tokenKeyRegening}
                                                             style={{ padding: '4px 14px', fontSize: '12px' }}
                                                         >
