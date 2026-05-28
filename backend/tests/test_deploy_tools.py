@@ -55,14 +55,10 @@ async def test_check_neon_quota_limit(mock_get):
 
 @pytest.mark.asyncio
 @patch("app.services.agent_tools._get_vercel_token")
-@patch("httpx.AsyncClient.patch")
 @patch("httpx.AsyncClient.post")
 @patch("httpx.AsyncClient.get")
-async def test_vercel_deploy_github(mock_get, mock_post, mock_patch, mock_get_token):
+async def test_vercel_deploy_github(mock_get, mock_post, mock_get_token):
     mock_get_token.return_value = "fake-token"
-
-    # Mock project protection patch
-    mock_patch.return_value = MagicMock(status_code=200, json=lambda: {})
 
     # Mock project linking and trigger
     mock_post.side_effect = [

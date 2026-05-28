@@ -925,12 +925,15 @@ To avoid unnecessary deployments, save Vercel build limits, and prevent serving 
    - Key: `DATABASE_URL`
    - Value: `<The connection string obtained>`
 3. **Deploy the application**: Once the environment variables are successfully configured in Vercel, call the `vercel_deploy` tool to deploy.
-   - **Note on Deployment Security**: The deploy tool automatically sends a request to disable Vercel's Deployment Protection (SSO/password protection) on project creation and deployment. This is done to enable full-auto debugging, screenshot verification, and crawling of preview URLs by the AI Agent.
+   - **Vercel Authentication / Login Wall Warning**:
+     Vercel preview URLs have a default login wall. You MUST remind the user to go to their Vercel dashboard (**Settings > Deployment Protection**) to change **Vercel Authentication** to **Disabled**.
+     - **Constraint**: Do not attempt to visit the webpage via `read_webpage` or browser tools until the user has confirmed they disabled this protection.
 
 ### 2.3 Development, Testing, and Debugging
 - **Local Verification (Optional)**: If the `execute_code` tool is enabled, run `npm run build` inside the workspace using the `execute_code` tool (with `bash` language) to ensure there are no compilation or TypeScript errors before deploying. Otherwise, skip local verification and deploy directly.
 - **Preview Deployment**: Call `vercel_deploy` (specifying `production=False`) to get a unique Preview URL.
 - **Automated Verification**: Use the Browser tool to navigate to the Preview URL, take screenshots, and verify the UI rendering and API operations.
+  - *CRITICAL*: Only run this after the user confirms they manually disabled Vercel Authentication.
 - **Build and Log Debugging**: If the build fails, call `vercel_get_deploy_logs` to view compilation or runtime logs to diagnose and fix errors.
 - **Production Deployment**: Once testing is successful, call `vercel_deploy` (specifying `production=True`) to publish to production.
 

@@ -14368,16 +14368,7 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
                 if create_res.status_code not in (200, 201):
                     return f"❌ Failed to create Vercel project '{project_name}': {create_res.text}"
                     
-            # 1.5 Disable Deployment Protection automatically to allow automated crawler debugging
-            patch_payload = {
-                "ssoProtection": None,
-                "passwordProtection": None
-            }
-            patch_res = await client.patch(f"https://api.vercel.com/v9/projects/{project_name}", headers=headers, json=patch_payload)
-            if patch_res.status_code == 200:
-                logger.info(f"Successfully disabled deployment protection for project '{project_name}'")
-            else:
-                logger.warning(f"Failed to disable deployment protection: {patch_res.text}")
+
                 
             dep_id = None
             dep_url = None
@@ -14483,14 +14474,19 @@ async def _vercel_deploy(agent_id: uuid.UUID, ws: Path, arguments: dict) -> str:
             quota_summary = await _get_vercel_quota_summary(token)
             
             if status == "READY":
+                warning_notice = (
+                    "\n\n⚠️ **Notice**: Vercel preview deployments are protected by a login wall by default. "
+                    "To let the Agent access and debug this page, please manually go to Vercel Project **Settings > Deployment Protection**, "
+                    "set **Vercel Authentication** to **Disabled**, and click **Save**."
+                )
                 return (
                     f"✅ **Deployment triggered successfully!**\n\n"
                     f"- **URL**: https://{dep_url}\n"
                     f"- **Status**: READY (Active)\n"
                     f"- **Project Name**: {project_name}\n"
-                    f"- **Deployment ID**: {dep_id}\n"
-                    f"- **Protection Bypass**: Disabled (Automatically turned off for automated debugging)\n\n"
+                    f"- **Deployment ID**: {dep_id}\n\n"
                     f"{quota_summary}"
+                    f"{warning_notice}"
                 )
             else:
                 return (
