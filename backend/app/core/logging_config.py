@@ -13,6 +13,19 @@ from uuid import uuid4
 trace_id_var: ContextVar[str] = ContextVar("trace_id", default=None)
 
 
+NOISY_CONNECTION_LOGGERS = {
+    # WebSocket accepted / HTTP access lines from uvicorn.
+    "uvicorn.access": logging.WARNING,
+    # "connection open" / "connection closed" emitted by websockets.
+    "websockets": logging.WARNING,
+    "websockets.server": logging.WARNING,
+    "websockets.client": logging.WARNING,
+    "uvicorn.protocols.websockets.websockets_impl": logging.WARNING,
+    # Supress "Failed to parse headers" warning from urllib3 when interacting with MinIO.
+    "urllib3.connection": logging.ERROR,
+}
+
+
 def get_trace_id() -> str:
     """Get current trace ID from context."""
     return trace_id_var.get()
@@ -32,7 +45,7 @@ def configure_logging():
     logger.add(
         sys.stdout,
         level="INFO",
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{extra[trace_id]:-<12}</cyan> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level}</level> | <cyan>{extra[trace_id]:-<12}</cyan> | <cyan>{name}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
         enqueue=True,
         backtrace=True,
         diagnose=True,
@@ -40,6 +53,13 @@ def configure_logging():
     )
 
     return logger
+
+
+def quiet_noisy_connection_loggers() -> None:
+    """Reduce chatty transport-level logs while keeping warnings/errors visible."""
+    for logger_name, level in NOISY_CONNECTION_LOGGERS.items():
+        target = logging.getLogger(logger_name)
+        target.setLevel(level)
 
 
 def intercept_standard_logging():
@@ -77,6 +97,7 @@ def intercept_standard_logging():
     for name in logging.root.manager.loggerDict:
         logging.getLogger(name).handlers = [InterceptHandler()]
         logging.getLogger(name).propagate = False
+    quiet_noisy_connection_loggers()
 
 
 # Configure on import

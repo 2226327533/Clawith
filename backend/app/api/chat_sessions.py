@@ -6,7 +6,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import select, func
+from sqlalchemy import cast, select, func, String
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_agent_access
@@ -38,6 +38,8 @@ class SessionOut(BaseModel):
     created_at: str
     last_message_at: Optional[str] = None
     message_count: int = 0
+    unread_count: int = 0
+    is_primary: bool = False
     # Agent-to-agent session fields
     peer_agent_id: Optional[str] = None
     peer_agent_name: Optional[str] = None
@@ -91,8 +93,10 @@ async def list_sessions(
 
         # --- BULK FETCH: message counts, user names, agent names in 3 queries total ---
         session_ids = [str(s.id) for s in sessions]
+        session_uuid_ids = [s.id for s in sessions]
 
         message_counts: dict[str, int] = {}
+        unread_counts: dict[str, int] = {}
         if session_ids:
             count_res = await db.execute(
                 select(ChatMessage.conversation_id, func.count(ChatMessage.id))
@@ -101,6 +105,25 @@ async def list_sessions(
             )
             for row in count_res.all():
                 message_counts[row[0]] = row[1]
+
+            unread_res = await db.execute(
+                select(ChatSession.id, func.count(ChatMessage.id))
+                .join(ChatMessage, ChatMessage.conversation_id == cast(ChatSession.id, String))
+                .where(
+                    ChatSession.id.in_(session_uuid_ids),
+                    ChatSession.user_id == current_user.id,
+                    ChatSession.source_channel.notin_(["agent", "trigger"]),
+                    ChatSession.is_group == False,
+                    ChatMessage.role.in_(["assistant", "system", "tool_call"]),
+                    ChatMessage.created_at > func.coalesce(
+                        ChatSession.last_read_at_by_user,
+                        datetime(1970, 1, 1, tzinfo=tz.utc),
+                    ),
+                )
+                .group_by(ChatSession.id)
+            )
+            for row in unread_res.all():
+                unread_counts[str(row[0])] = int(row[1] or 0)
 
         # Collect IDs to resolve in bulk
         from app.models.user import Identity
@@ -161,6 +184,8 @@ async def list_sessions(
                 created_at=session.created_at.isoformat(),
                 last_message_at=session.last_message_at.isoformat() if session.last_message_at else None,
                 message_count=count,
+                unread_count=unread_counts.get(str(session.id), 0),
+                is_primary=bool(session.is_primary),
                 peer_agent_id=peer_agent_id,
                 peer_agent_name=peer_agent_name,
                 participant_type="group" if session.is_group else participant_type,
@@ -183,17 +208,16 @@ async def list_sessions(
         sessions = result.scalars().all()
         out = []
 
-        # --- BULK FETCH: count user messages and total messages in one query ---
-        from sqlalchemy import case
+        # --- BULK FETCH: count total messages and unread messages in two compact queries ---
         session_ids = [str(s.id) for s in sessions]
+        session_uuid_ids = [s.id for s in sessions]
 
-        user_msg_counts: dict[str, int] = {}
         total_counts: dict[str, int] = {}
+        unread_counts: dict[str, int] = {}
         if session_ids:
             counts_res = await db.execute(
                 select(
                     ChatMessage.conversation_id,
-                    func.sum(case((ChatMessage.role == "user", 1), else_=0)),
                     func.count(ChatMessage.id)
                 ).where(
                     ChatMessage.conversation_id.in_(session_ids),
@@ -201,14 +225,31 @@ async def list_sessions(
                 ).group_by(ChatMessage.conversation_id)
             )
             for row in counts_res.all():
-                user_msg_counts[row[0]] = int(row[1] or 0)
-                total_counts[row[0]] = int(row[2] or 0)
+                total_counts[row[0]] = int(row[1] or 0)
+
+            unread_res = await db.execute(
+                select(ChatSession.id, func.count(ChatMessage.id))
+                .join(ChatMessage, ChatMessage.conversation_id == cast(ChatSession.id, String))
+                .where(
+                    ChatSession.id.in_(session_uuid_ids),
+                    ChatMessage.role.in_(["assistant", "system", "tool_call"]),
+                    ChatMessage.created_at > func.coalesce(
+                        ChatSession.last_read_at_by_user,
+                        datetime(1970, 1, 1, tzinfo=tz.utc),
+                    ),
+                )
+                .group_by(ChatSession.id)
+            )
+            for row in unread_res.all():
+                unread_counts[str(row[0])] = int(row[1] or 0)
 
         for session in sessions:
-            user_msg_count = user_msg_counts.get(str(session.id), 0)
-            if user_msg_count == 0:
-                continue  # hide empty or orphan sessions
+            # Hide truly empty / orphan sessions. Onboarding sessions have zero
+            # user messages (the agent greets first) but do have assistant
+            # turns, so count ALL messages here — not just user ones.
             count = total_counts.get(str(session.id), 0)
+            if count == 0:
+                continue
             out.append(SessionOut(
                 id=str(session.id),
                 agent_id=str(session.agent_id),
@@ -218,6 +259,8 @@ async def list_sessions(
                 created_at=session.created_at.isoformat(),
                 last_message_at=session.last_message_at.isoformat() if session.last_message_at else None,
                 message_count=count,
+                unread_count=unread_counts.get(str(session.id), 0),
+                is_primary=bool(session.is_primary),
             ))
         return out
 
@@ -240,6 +283,7 @@ async def create_session(
         user_id=current_user.id,
         title=body.title or f"Session {now.strftime('%m-%d %H:%M')}",
         source_channel="web",
+        is_primary=False,
         created_at=now,
     )
     db.add(session)
@@ -254,6 +298,8 @@ async def create_session(
         created_at=session.created_at.isoformat(),
         last_message_at=None,
         message_count=0,
+        unread_count=0,
+        is_primary=False,
         participant_type="user",
         is_group=False,
     )
@@ -315,6 +361,8 @@ async def delete_session(
 async def get_session_messages(
     agent_id: uuid.UUID,
     session_id: uuid.UUID,
+    limit: int = Query(20, ge=1, le=500, description="Number of messages to return"),
+    before: str = Query(None, description="Cursor: return messages created before this timestamp (ISO format)"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -336,30 +384,42 @@ async def get_session_messages(
         raise HTTPException(status_code=403, detail="Not authorized to view this session")
 
     # Query messages by conversation_id only (agent-to-agent uses session_agent_id)
-    # Query the latest 500 messages (subquery in DESC, then reverse for display order)
+    # Optimized: use a single query with ORDER BY and LIMIT instead of subquery
     from sqlalchemy import desc
-    latest_subq = (
-        select(ChatMessage.id)
+    query = (
+        select(ChatMessage)
         .where(ChatMessage.conversation_id == str(session_id))
         .order_by(desc(ChatMessage.created_at))
-        .limit(500)
-        .subquery()
+        .limit(limit)
     )
-    msgs_result = await db.execute(
-        select(ChatMessage)
-        .where(ChatMessage.id.in_(select(latest_subq.c.id)))
-        .order_by(ChatMessage.created_at.asc())
-    )
-    messages = msgs_result.scalars().all()
+    # Apply cursor filter if `before` timestamp is provided
+    if before:
+        from datetime import datetime as dt
+        try:
+            before_dt = dt.fromisoformat(before.replace('Z', '+00:00'))
+            query = query.where(ChatMessage.created_at < before_dt)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid `before` timestamp format. Use ISO 8601.")
+    msgs_result = await db.execute(query)
+    messages = list(reversed(msgs_result.scalars().all()))
 
-    # Resolve sender names for agent sessions
+    # Reading your own first-party/channel session should clear its unread state.
+    if str(session.user_id) == str(current_user.id) and not session.is_group and session.source_channel not in ("agent", "trigger"):
+        session.last_read_at_by_user = datetime.now(tz.utc)
+        await db.commit()
+
+    # Batch fetch all participant names to avoid N+1 queries
     sender_cache: dict = {}
     if session.source_channel == "agent":
         from app.models.participant import Participant
-        for m in messages:
-            if m.participant_id and str(m.participant_id) not in sender_cache:
-                p_r = await db.execute(select(Participant.display_name).where(Participant.id == m.participant_id))
-                sender_cache[str(m.participant_id)] = p_r.scalar_one_or_none() or "Unknown"
+        participant_ids = list({m.participant_id for m in messages if m.participant_id})
+        if participant_ids:
+            p_result = await db.execute(
+                select(Participant.id, Participant.display_name)
+                .where(Participant.id.in_(participant_ids))
+            )
+            for row in p_result.all():
+                sender_cache[str(row[0])] = row[1] or "Unknown"
 
     out = []
     for m in messages:
@@ -375,6 +435,7 @@ async def get_session_messages(
                 entry["toolArgs"] = data.get("args")
                 entry["toolStatus"] = data.get("status", "done")
                 entry["toolResult"] = data.get("result", "")
+                entry["toolThinking"] = data.get("reasoning_content", "")
             except Exception:
                 pass
             if sender_name:
