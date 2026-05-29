@@ -103,15 +103,21 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
             result = await db.execute(select(Agent).where(Agent.id == agent_id))
             agent = result.scalar_one_or_none()
             if not agent or agent.is_expired:
+                if execution_ids:
+                    await mark_trigger_executions_failed(execution_ids, "Agent not found or is expired")
                 return
 
             if not agent.primary_model_id:
                 logger.warning(f"Agent {agent.name} has no LLM model, skipping trigger invocation")
+                if execution_ids:
+                    await mark_trigger_executions_failed(execution_ids, "Agent has no LLM model configured")
                 return
             result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
             model = result.scalar_one_or_none()
             if not model or not model.enabled:
                 logger.warning(f"Agent {agent.name}'s model is unavailable, skipping trigger invocation")
+                if execution_ids:
+                    await mark_trigger_executions_failed(execution_ids, "Agent primary model is unavailable or disabled")
                 return
 
             context_parts = []
@@ -234,6 +240,13 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
             except Exception as e:
                 logger.warning(f"Failed to persist tool call for trigger session: {e}")
 
+        from_agent_name = None
+        for t in triggers:
+            cfg = t.config or {}
+            if cfg.get("from_agent_name"):
+                from_agent_name = cfg.get("from_agent_name")
+                break
+
         reply = await call_llm(
             model=model,
             messages=messages,
@@ -244,6 +257,7 @@ async def invoke_agent_for_triggers(agent_id: uuid.UUID, triggers: list[AgentTri
             session_id=str(session_id),
             on_chunk=on_chunk,
             on_tool_call=on_tool_call,
+            current_user_name_override=from_agent_name,
         )
 
         async with async_session() as db:
