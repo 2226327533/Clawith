@@ -125,7 +125,7 @@ steps:
       - RESULT=$?
       - |
         if [ $RESULT -ne 0 ]; then
-          echo "部署测试失败: backend 启动超时"
+          echo "❌ 部署测试失败: backend 启动超时"
           docker compose -f docker-compose.ci.yml logs --tail=100 backend
           exit 1
         fi
@@ -135,19 +135,19 @@ steps:
       - |
         MIGRATION_LOG=$(docker compose -f docker-compose.ci.yml logs --tail=200 backend 2>&1)
         if echo "$MIGRATION_LOG" | grep -Eqi "migration.*FAIL|alembic.*error"; then
-          echo "部署测试失败: 检测到数据库迁移失败"
+          echo "❌ 部署测试失败: 检测到数据库迁移失败"
           echo "$MIGRATION_LOG" | grep -Ei "migration|alembic|error|FAIL"
           exit 1
         fi
 
       # 验证 health endpoint (通过 docker compose exec 直接在容器内 curl)
       - echo "验证 health endpoint..."
-      - timeout 10s bash -c 'until docker compose -f docker-compose.ci.yml exec -T backend curl -sf http://localhost:8000/api/health > /dev/null 2>&1; do sleep 2; done' || (echo "health endpoint 不可达" && exit 1)
+      - timeout 10s bash -c 'until docker compose -f docker-compose.ci.yml exec -T backend curl -sf http://localhost:8000/api/health > /dev/null 2>&1; do sleep 2; done' || (echo "❌ health endpoint 不可达" && exit 1)
 
       # 清理环境
       - echo "清理测试环境..."
       - docker compose -f docker-compose.ci.yml down -v --remove-orphans
-      - echo "本地部署测试通过"
+      - echo "✅ 本地部署测试通过"
 
   # --------------------------------------------------------
   # Step 4: 本地升级测试 (Upgrade Test)
@@ -161,11 +161,11 @@ steps:
     commands:
       - apk add --no-cache docker-cli-compose curl bash
       - echo "========================================"
-      - echo "本地升级测试 旧版 -> 新版数据库迁移验证"
+      - echo "本地升级测试 旧版 → 新版数据库迁移验证"
       - echo "========================================"
       - |
         if [ -f ".env.drone" ] && grep -q "SKIP_UPGRADE_TEST=true" ".env.drone"; then
-          echo "未找到历史 tag，跳过升级测试"
+          echo "⚠️ 未找到历史 tag，跳过升级测试"
           exit 0
         fi
 
@@ -196,7 +196,7 @@ steps:
       - RESULT=$?
       - |
         if [ $RESULT -ne 0 ]; then
-          echo "升级测试失败: 旧版 backend 启动超时"
+          echo "❌ 升级测试失败: 旧版 backend 启动超时"
           docker logs --tail=100 backend-upgrade-test
           exit 1
         fi
@@ -223,7 +223,7 @@ steps:
       - RESULT=$?
       - |
         if [ $RESULT -ne 0 ]; then
-          echo "升级测试失败: 新版 backend 启动超时"
+          echo "❌ 升级测试失败: 新版 backend 启动超时"
           docker logs --tail=200 backend-upgrade-test
           exit 1
         fi
@@ -231,19 +231,19 @@ steps:
       - |
         UPGRADE_LOG=$(docker logs --tail=300 backend-upgrade-test 2>&1)
         if echo "$UPGRADE_LOG" | grep -Eqi "migration.*FAIL|alembic.*error|WARNING.*migration"; then
-          echo "升级测试失败: 检测到数据库迁移异常"
+          echo "❌ 升级测试失败: 检测到数据库迁移异常"
           echo "$UPGRADE_LOG" | grep -Ei "migration|alembic|error|FAIL|WARNING"
           exit 1
         fi
 
-      - timeout 10s bash -c 'until docker exec backend-upgrade-test curl -sf http://localhost:8000/api/health > /dev/null 2>&1; do sleep 2; done' || (echo "health endpoint 不可达" && exit 1)
+      - timeout 10s bash -c 'until docker exec backend-upgrade-test curl -sf http://localhost:8000/api/health > /dev/null 2>&1; do sleep 2; done' || (echo "❌ health endpoint 不可达" && exit 1)
 
       - docker exec backend-upgrade-test alembic history 2>&1 | head -5 || true
       - docker exec backend-upgrade-test alembic current 2>&1 || true
 
       - docker rm -f backend-upgrade-test
       - docker compose -f docker-compose.ci.yml down -v --remove-orphans
-      - echo "本地升级测试通过"
+      - echo "✅ 本地升级测试通过"
 
   # --------------------------------------------------------
   # Step 5: 导出镜像文件
