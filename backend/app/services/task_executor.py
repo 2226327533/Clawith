@@ -13,6 +13,7 @@ from loguru import logger
 from sqlalchemy import select
 
 from app.config import get_settings
+from app.core.logging_config import new_trace_id, set_trace_id
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.llm import LLMModel
@@ -21,7 +22,7 @@ from app.models.task import Task, TaskLog
 settings = get_settings()
 
 
-async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
+async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID, trace_id: str | None = None) -> None:
     """Execute a task using the agent's configured LLM with full context.
 
     Uses the same context as chat dialog: build_agent_context for system prompt,
@@ -31,7 +32,18 @@ async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
       - todo tasks: pending → doing → done
       - supervision tasks: pending → doing → pending (stays active, just logs result)
     """
+    if trace_id:
+        set_trace_id(trace_id)
+    else:
+        trace_id = new_trace_id()
     logger.info(f"[TaskExec] Starting task {task_id} for agent {agent_id}")
+    logger.bind(
+        act="agent_loop",
+        event="task_start",
+        trace_id=trace_id,
+        task_id=str(task_id),
+        agent_id=str(agent_id),
+    ).info("agent_loop task_start")
 
     # Step 1: Mark as doing
     async with async_session() as db:
@@ -54,6 +66,15 @@ async def execute_task(task_id: uuid.UUID, agent_id: uuid.UUID) -> None:
         agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
         agent = agent_result.scalar_one_or_none()
         if not agent:
+            logger.bind(
+                act="agent_loop",
+                event="task_end",
+                trace_id=trace_id,
+                task_id=str(task_id),
+                agent_id=str(agent_id),
+                status="failed",
+                error="agent_not_found",
+            ).info("agent_loop task_end")
             await _log_error(task_id, "数字员工未找到")
             if task_type == 'supervision':
                 await _restore_supervision_status(task_id)
@@ -115,6 +136,15 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
     except Exception as e:
         error_msg = str(e) or repr(e)
         logger.error(f"[TaskExec] Error: {error_msg}")
+        logger.bind(
+            act="agent_loop",
+            event="task_end",
+            trace_id=trace_id,
+            task_id=str(task_id),
+            agent_id=str(agent_id),
+            status="failed",
+            error=error_msg[:500],
+        ).info("agent_loop task_end")
         await _log_error(task_id, f"执行出错: {error_msg[:150]}")
         if task_type == 'supervision':
             await _restore_supervision_status(task_id)
@@ -135,6 +165,15 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
                 db.add(TaskLog(task_id=task_id, content=f"✅ 任务完成\n\n{reply}"))
             await db.commit()
             logger.info(f"[TaskExec] Task {task_id} {'logged' if task_type == 'supervision' else 'completed'}!")
+            logger.bind(
+                act="agent_loop",
+                event="task_end",
+                trace_id=trace_id,
+                task_id=str(task_id),
+                agent_id=str(agent_id),
+                status="succeeded",
+                reply_len=len(reply or ""),
+            ).info("agent_loop task_end")
 
     # Log activity
     from app.services.activity_logger import log_activity

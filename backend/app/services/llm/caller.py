@@ -21,6 +21,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
+from app.core.logging_config import get_trace_id, new_trace_id
 from app.database import async_session
 
 # NOTE: agent_tools imports are deferred to function bodies to avoid circular
@@ -54,6 +55,9 @@ TOOLS_REQUIRING_ARGS = frozenset({
     "write_file", "read_file", "move_file", "delete_file", "read_document",
     "send_message_to_agent", "send_feishu_message", "send_email"
 })
+
+TRACE_FIELD_CHAR_LIMIT = 4000
+TRACE_SEQUENCE_LIMIT = 50
 
 
 def _sanitize_tool_calls_for_context(tool_calls: list[dict]) -> tuple[list[dict] | None, str | None]:
@@ -163,6 +167,71 @@ def _usage_from_response_or_estimate(response, api_messages: list[LLMMessage]) -
     round_chars = sum(len(m.content or '') if isinstance(m.content, str) else 0 for m in api_messages)
     round_chars += len(response.content or '')
     return estimate_token_usage_from_chars(round_chars)
+
+
+def _trace_safe(value, *, max_chars: int = TRACE_FIELD_CHAR_LIMIT, depth: int = 0):
+    """Convert values attached to structured trace logs into bounded JSON-safe data."""
+    if depth > 4:
+        return str(value)[:max_chars]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        if len(value) <= max_chars:
+            return value
+        return value[:max_chars] + f"...[truncated {len(value) - max_chars} chars]"
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _trace_safe(val, max_chars=max_chars, depth=depth + 1)
+            for key, val in list(value.items())[:TRACE_SEQUENCE_LIMIT]
+        }
+    if isinstance(value, (list, tuple)):
+        items = [
+            _trace_safe(item, max_chars=max_chars, depth=depth + 1)
+            for item in list(value)[:TRACE_SEQUENCE_LIMIT]
+        ]
+        if len(value) > TRACE_SEQUENCE_LIMIT:
+            items.append(f"...[truncated {len(value) - TRACE_SEQUENCE_LIMIT} items]")
+        return items
+    return _trace_safe(str(value), max_chars=max_chars, depth=depth + 1)
+
+
+def _trace_message(message) -> dict:
+    if isinstance(message, dict):
+        return _trace_safe(message)
+    payload = {
+        "role": getattr(message, "role", None),
+        "content": getattr(message, "content", None),
+    }
+    dynamic_content = getattr(message, "dynamic_content", None)
+    if dynamic_content:
+        payload["dynamic_content"] = dynamic_content
+    tool_calls = getattr(message, "tool_calls", None)
+    if tool_calls:
+        payload["tool_calls"] = tool_calls
+    tool_call_id = getattr(message, "tool_call_id", None)
+    if tool_call_id:
+        payload["tool_call_id"] = tool_call_id
+    reasoning_content = getattr(message, "reasoning_content", None)
+    if reasoning_content:
+        payload["reasoning_content"] = reasoning_content
+    return _trace_safe(payload)
+
+
+def _trace_messages(messages: list) -> list[dict]:
+    return [_trace_message(message) for message in messages[:TRACE_SEQUENCE_LIMIT]]
+
+
+def _log_agent_loop(event: str, **fields) -> None:
+    trace_id = get_trace_id() or new_trace_id()
+    payload = {
+        "act": "agent_loop",
+        "event": event,
+        "trace_id": trace_id,
+    }
+    payload.update({key: _trace_safe(value) for key, value in fields.items() if value is not None})
+    logger.bind(**payload).info(f"agent_loop {event}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -312,6 +381,16 @@ async def _process_tool_call(
         args = json.loads(raw_args) if raw_args else {}
     except json.JSONDecodeError:
         args = {}
+    _log_agent_loop(
+        "tool_call",
+        agent_id=agent_id,
+        user_id=user_id,
+        session_id=session_id,
+        tool_name=tool_name,
+        call_id=tc.get("id", ""),
+        args=args,
+        raw_args=raw_args,
+    )
 
     # Guard: check if tool requires arguments
     should_execute, error_msg = _check_tool_requires_args(tool_name, args)
@@ -363,6 +442,15 @@ async def _process_tool_call(
         on_output=_on_output,
     )
     logger.debug(f"[LLM] Tool result: {result[:100]}")
+    _log_agent_loop(
+        "tool_result",
+        agent_id=agent_id,
+        user_id=user_id,
+        session_id=session_id,
+        tool_name=tool_name,
+        call_id=tc.get("id", ""),
+        result=result,
+    )
 
     # ── Vision injection for screenshot tools ──
     tool_content: str | list = str(result)
@@ -518,6 +606,18 @@ async def call_llm(
                 content="🚨 仅剩 2 轮工具调用。请立即使用 upsert_focus_item 保存进度并设置续接触发器。",
             ))
 
+        _log_agent_loop(
+            "prompt",
+            agent_id=agent_id,
+            user_id=user_id,
+            session_id=session_id,
+            provider=model.provider,
+            model=model.model,
+            round=round_i + 1,
+            messages_count=len(api_messages),
+            messages=_trace_messages(api_messages),
+        )
+
         try:
             # Use streaming API for real-time responses
             async def _buffer_chunk(_text: str) -> None:
@@ -546,6 +646,21 @@ async def call_llm(
             await client.close()
             return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
 
+        _log_agent_loop(
+            "response",
+            agent_id=agent_id,
+            user_id=user_id,
+            session_id=session_id,
+            provider=model.provider,
+            model=model.model,
+            round=round_i + 1,
+            content=response.content,
+            reasoning_content=response.reasoning_content,
+            tool_calls=response.tool_calls,
+            tool_calls_count=len(response.tool_calls or []),
+            usage=response.usage,
+        )
+
         # Track tokens for this round
         _accumulated_usage.add(_usage_from_response_or_estimate(response, api_messages))
 
@@ -567,6 +682,17 @@ async def call_llm(
         finish_call = find_finish_call(sanitized_tool_calls)
         if finish_call:
             if finish_call.valid:
+                _log_agent_loop(
+                    "response",
+                    agent_id=agent_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    provider=model.provider,
+                    model=model.model,
+                    round=round_i + 1,
+                    content=finish_call.content,
+                    finish=True,
+                )
                 if agent_id and _accumulated_usage.total_tokens > 0:
                     await record_token_usage(agent_id, _accumulated_usage)
                 await client.close()
@@ -619,6 +745,16 @@ async def call_llm(
     if agent_id and _accumulated_usage.total_tokens > 0:
         await record_token_usage(agent_id, _accumulated_usage)
     await client.close()
+    _log_agent_loop(
+        "response",
+        agent_id=agent_id,
+        user_id=user_id,
+        session_id=session_id,
+        provider=model.provider,
+        model=model.model,
+        content="[Error] Too many tool call rounds",
+        error="too_many_tool_call_rounds",
+    )
     return "[Error] Too many tool call rounds"
 
 
@@ -900,6 +1036,17 @@ async def call_agent_llm_with_tools(
             # Tool-calling loop
             api_messages = list(messages)
             for round_i in range(max_rounds):
+                _log_agent_loop(
+                    "prompt",
+                    agent_id=agent_id,
+                    user_id=agent.creator_id,
+                    session_id=session_id,
+                    provider=model.provider,
+                    model=model.model,
+                    round=round_i + 1,
+                    messages_count=len(api_messages),
+                    messages=_trace_messages(api_messages),
+                )
                 try:
                     response = await client.complete(
                         messages=api_messages,
@@ -913,6 +1060,21 @@ async def call_agent_llm_with_tools(
                     if agent_id and _accumulated_usage.total_tokens > 0:
                         await record_token_usage(agent_id, _accumulated_usage)
                     raise
+
+                _log_agent_loop(
+                    "response",
+                    agent_id=agent_id,
+                    user_id=agent.creator_id,
+                    session_id=session_id,
+                    provider=model.provider,
+                    model=model.model,
+                    round=round_i + 1,
+                    content=response.content,
+                    reasoning_content=response.reasoning_content,
+                    tool_calls=response.tool_calls,
+                    tool_calls_count=len(response.tool_calls or []),
+                    usage=response.usage,
+                )
 
                 # Track tokens for this round
                 _accumulated_usage.add(_usage_from_response_or_estimate(response, api_messages))
@@ -932,6 +1094,17 @@ async def call_agent_llm_with_tools(
                 finish_call = find_finish_call(sanitized_tool_calls)
                 if finish_call:
                     if finish_call.valid:
+                        _log_agent_loop(
+                            "response",
+                            agent_id=agent_id,
+                            user_id=agent.creator_id,
+                            session_id=session_id,
+                            provider=model.provider,
+                            model=model.model,
+                            round=round_i + 1,
+                            content=finish_call.content,
+                            finish=True,
+                        )
                         if agent_id and _accumulated_usage.total_tokens > 0:
                             await record_token_usage(agent_id, _accumulated_usage)
                         await client.close()
@@ -965,6 +1138,16 @@ async def call_agent_llm_with_tools(
                     except json.JSONDecodeError:
                         args = {}
 
+                    _log_agent_loop(
+                        "tool_call",
+                        agent_id=agent_id,
+                        user_id=agent.creator_id,
+                        session_id=session_id,
+                        tool_name=tool_name,
+                        call_id=tc.get("id", ""),
+                        args=args,
+                        raw_args=raw_args,
+                    )
                     tool_executed = True
                     if tool_name not in allowed_tool_names:
                         logger.warning(f"[call_agent_llm_with_tools] Blocked disabled tool call: {tool_name} agent_id={agent_id}")
@@ -976,6 +1159,15 @@ async def call_agent_llm_with_tools(
                             user_id=agent.creator_id,
                             session_id=session_id,
                         )
+                    _log_agent_loop(
+                        "tool_result",
+                        agent_id=agent_id,
+                        user_id=agent.creator_id,
+                        session_id=session_id,
+                        tool_name=tool_name,
+                        call_id=tc.get("id", ""),
+                        result=result,
+                    )
                     api_messages.append(LLMMessage(
                         role="tool",
                         tool_call_id=tc["id"],
@@ -985,6 +1177,16 @@ async def call_agent_llm_with_tools(
             if agent_id and _accumulated_usage.total_tokens > 0:
                 await record_token_usage(agent_id, _accumulated_usage)
             await client.close()
+            _log_agent_loop(
+                "response",
+                agent_id=agent_id,
+                user_id=agent.creator_id,
+                session_id=session_id,
+                provider=model.provider,
+                model=model.model,
+                content="[Error] Too many tool call rounds",
+                error="too_many_tool_call_rounds",
+            )
             return "[Error] Too many tool call rounds", False, tool_executed
 
         except Exception as e:

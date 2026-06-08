@@ -13,7 +13,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.logging_config import set_trace_id
+from app.core.logging_config import get_trace_id, set_trace_id
 from app.core.permissions import check_agent_access, is_agent_expired
 from app.core.security import decode_access_token, get_current_user
 from app.database import async_session, get_db
@@ -511,6 +511,16 @@ class WebSocketChatHandler:
             override_model_id = data.get("model_id")
             is_onboarding_trigger = data.get("kind") == "onboarding_trigger"
             logger.info(f"[WS] Received: {content[:50]}" + (" [onboarding]" if is_onboarding_trigger else ""))
+            logger.bind(
+                act="agent_loop",
+                event="ws_message",
+                trace_id=trace_id,
+                agent_id=str(self.agent_id),
+                user_id=str(self.user.id),
+                session_id=self.conv_id,
+                content=content[:4000],
+                content_preview=content[:100],
+            ).info("agent_loop ws_message")
 
             if not content and not is_onboarding_trigger:
                 continue
@@ -569,7 +579,12 @@ class WebSocketChatHandler:
             await self._save_assistant_reply(assistant_response, thinking_content)
 
             # Final 'done' packet
-            await self.websocket.send_json({"type": "done", "role": "assistant", "content": assistant_response})
+            await self.websocket.send_json({
+                "type": "done",
+                "role": "assistant",
+                "content": assistant_response,
+                "trace_id": get_trace_id(),
+            })
 
             # Re-process any queued messages (if user sent something during generation)
             for qm in queued_messages:
@@ -643,10 +658,20 @@ class WebSocketChatHandler:
             await check_agent_expired(self.agent_id)
             return True
         except QuotaExceeded as qe:
-            await self.websocket.send_json({"type": "done", "role": "assistant", "content": f"⚠️ {qe.message}"})
+            await self.websocket.send_json({
+                "type": "done",
+                "role": "assistant",
+                "content": f"⚠️ {qe.message}",
+                "trace_id": get_trace_id(),
+            })
             return False
         except AgentExpired as ae:
-            await self.websocket.send_json({"type": "done", "role": "assistant", "content": f"⚠️ {ae.message}"})
+            await self.websocket.send_json({
+                "type": "done",
+                "role": "assistant",
+                "content": f"⚠️ {ae.message}",
+                "trace_id": get_trace_id(),
+            })
             return False
 
     async def _save_user_message(self, content: str, display_content: str, file_name: str, is_onboarding_trigger: bool):

@@ -1,8 +1,8 @@
-"""Centralized logging configuration using loguru."""
-
-import sys
 import logging
+import os
+import sys
 from contextvars import ContextVar
+from pathlib import Path
 
 from loguru import logger
 
@@ -10,6 +10,7 @@ from loguru import logger
 from uuid import uuid4
 
 trace_id_var: ContextVar[str] = ContextVar("trace_id", default=None)
+AGENT_TRACE_LOG_FILENAME = "agent_trace.jsonl"
 
 
 NOISY_CONNECTION_LOGGERS = {
@@ -47,6 +48,28 @@ def new_trace_id() -> str:
     return tid
 
 
+def get_agent_trace_log_dir() -> Path:
+    """Return the directory used for structured agent-loop trace logs."""
+    return Path(os.getenv("AGENT_TRACE_LOG_DIR", "logs")).expanduser()
+
+
+def get_agent_trace_log_path() -> Path:
+    """Return the active JSONL file used for structured agent-loop trace logs."""
+    return get_agent_trace_log_dir() / AGENT_TRACE_LOG_FILENAME
+
+
+def _ensure_record_trace_id(record) -> bool:
+    if not record["extra"].get("trace_id"):
+        record["extra"]["trace_id"] = get_trace_id() or str(uuid4())
+    return True
+
+
+def _agent_trace_filter(record) -> bool:
+    if record["extra"].get("act") is None:
+        return False
+    return _ensure_record_trace_id(record)
+
+
 def _disable_agentbay_logger_override():
     """Disable AgentBay SDK's logging override to prevent it from resetting loguru."""
     if "agentbay._common.logger" in sys.modules:
@@ -71,8 +94,26 @@ def configure_logging():
         enqueue=True,
         backtrace=True,
         diagnose=True,
-        filter=lambda record: (record["extra"].setdefault("trace_id", get_trace_id() or str(uuid4())) is not None)
+        filter=_ensure_record_trace_id,
     )
+
+    try:
+        trace_log_path = get_agent_trace_log_path()
+        trace_log_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.add(
+            str(trace_log_path),
+            level="INFO",
+            format="{message}",
+            filter=_agent_trace_filter,
+            serialize=True,
+            rotation="50 MB",
+            retention="7 days",
+            enqueue=True,
+            backtrace=False,
+            diagnose=False,
+        )
+    except Exception as exc:
+        logger.warning(f"[logging] agent trace JSONL sink disabled: {exc}")
 
     _disable_agentbay_logger_override()
 
