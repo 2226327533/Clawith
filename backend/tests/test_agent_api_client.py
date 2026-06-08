@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import uuid
 import zipfile
 from io import BytesIO
 from types import SimpleNamespace
@@ -265,6 +267,98 @@ async def test_agent_api_client_chat_sync_include_logs_fetches_trace(monkeypatch
     assert http.requests[0]["path"] == "/api/logs/agent-trace"
     assert http.requests[0]["params"]["trace_id"] == "trace-1"
     assert captured["sent"] == {"content": "hello"}
+
+
+@pytest.mark.skipif(sys.version_info < (3, 10), reason="requires backend runtime imports")
+@pytest.mark.asyncio
+async def test_call_agent_llm_with_tools_logs_task_id(monkeypatch):
+    from app.services.llm import caller
+
+    class FakeResult:
+        def __init__(self, value):
+            self.value = value
+
+        def scalar_one_or_none(self):
+            return self.value
+
+    class FakeDB:
+        def __init__(self, values):
+            self.values = list(values)
+
+        async def execute(self, _statement):
+            return FakeResult(self.values.pop(0))
+
+    class FakeClient:
+        async def complete(self, **_kwargs):
+            return SimpleNamespace(
+                content="",
+                reasoning_content=None,
+                tool_calls=[
+                    {
+                        "id": "finish-1",
+                        "type": "function",
+                        "function": {
+                            "name": "finish",
+                            "arguments": json.dumps({"content": "done"}),
+                        },
+                    }
+                ],
+                usage=None,
+            )
+
+        async def close(self):
+            return None
+
+    agent_id = uuid.uuid4()
+    creator_id = uuid.uuid4()
+    model_id = uuid.uuid4()
+    task_id = str(uuid.uuid4())
+    logged = []
+
+    fake_agent = SimpleNamespace(
+        id=agent_id,
+        name="Task Logger",
+        creator_id=creator_id,
+        primary_model_id=model_id,
+        fallback_model_id=None,
+    )
+    fake_model = SimpleNamespace(
+        provider="openai",
+        model="gpt-test",
+        base_url=None,
+        temperature=None,
+        max_output_tokens=None,
+        request_timeout=None,
+    )
+
+    monkeypatch.setattr(caller, "_log_agent_loop", lambda event, **fields: logged.append((event, fields)))
+    async def fake_get_agent_tools_for_llm(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(caller, "get_agent_tools_for_llm", fake_get_agent_tools_for_llm)
+    monkeypatch.setattr(caller, "create_llm_client", lambda **_kwargs: FakeClient())
+    monkeypatch.setattr(caller, "get_model_api_key", lambda _model: "test-key")
+    monkeypatch.setattr(caller, "get_max_tokens", lambda *_args, **_kwargs: 16)
+
+    async def fake_record_token_usage(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(caller, "record_token_usage", fake_record_token_usage)
+
+    reply = await caller.call_agent_llm_with_tools(
+        db=FakeDB([fake_agent, fake_model]),
+        agent_id=agent_id,
+        system_prompt="system",
+        user_prompt="user",
+        max_rounds=1,
+        session_id=task_id,
+        task_id=task_id,
+    )
+
+    assert reply == "done"
+    prompt_or_response = [fields for event, fields in logged if event in {"prompt", "response"}]
+    assert prompt_or_response
+    assert all(fields["task_id"] == task_id for fields in prompt_or_response)
 
 
 def _log_line(timestamp: float, **extra) -> str:

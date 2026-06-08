@@ -130,6 +130,7 @@ You are now in TASK EXECUTION MODE (not a conversation). A task has been assigne
                 user_prompt=user_prompt,
                 max_rounds=50,
                 session_id=str(task_id),
+                task_id=str(task_id),
             )
             
         logger.info(f"[TaskExec] LLM reply: {reply[:80]}")

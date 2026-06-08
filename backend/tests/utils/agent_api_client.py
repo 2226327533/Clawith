@@ -66,6 +66,7 @@ class AgentApiClient:
                 base_url=self.base_url,
                 timeout=self.timeout,
                 follow_redirects=True,
+                trust_env=False,
             )
         return self._client
 
@@ -142,6 +143,15 @@ class AgentApiClient:
 
     async def list_agents(self, **params) -> list[dict[str, Any]]:
         return (await self._request("GET", "/api/agents/", params=params or None)).json()
+
+    async def list_llm_models(self, **params) -> list[dict[str, Any]]:
+        return (await self._request("GET", "/api/enterprise/llm-models", params=params or None)).json()
+
+    async def list_tools(self, **params) -> list[dict[str, Any]]:
+        return (await self._request("GET", "/api/tools", params=params or None)).json()
+
+    async def list_skills(self) -> list[dict[str, Any]]:
+        return (await self._request("GET", "/api/skills/")).json()
 
     async def create_agent(self, data: dict[str, Any] | None = None, **fields) -> dict[str, Any]:
         payload = {**(data or {}), **fields}
@@ -259,6 +269,36 @@ class AgentApiClient:
     async def get_run_logs(self, agent_id: str, run_id: str) -> list[dict[str, Any]]:
         return (await self._request("GET", f"/api/agents/{agent_id}/tasks/{run_id}/logs")).json()
 
+    async def wait_for_run(
+        self,
+        agent_id: str,
+        run_id: str,
+        *,
+        timeout: float = 180.0,
+        poll_interval: float = 2.0,
+    ) -> dict[str, Any]:
+        """Poll until a task-backed run reaches a terminal state or emits an error log."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        last_status: dict[str, Any] | None = None
+        while True:
+            last_status = await self.get_run_status(agent_id, run_id)
+            if last_status.get("status") == "done":
+                return last_status
+
+            logs = await self.get_run_logs(agent_id, run_id)
+            error_log = next(
+                (entry for entry in logs if str(entry.get("content", "")).lstrip().startswith("❌")),
+                None,
+            )
+            if error_log:
+                last_status = dict(last_status)
+                last_status["error_log"] = error_log
+                return last_status
+
+            if asyncio.get_running_loop().time() >= deadline:
+                return last_status
+            await asyncio.sleep(poll_interval)
+
     async def trigger_task(self, agent_id: str, task_id: str) -> dict[str, Any]:
         return (await self._request("POST", f"/api/agents/{agent_id}/tasks/{task_id}/trigger")).json()
 
@@ -269,15 +309,23 @@ class AgentApiClient:
         title: str,
         prompt: str,
         workspace_root: str = "",
+        wait_timeout: float = 180.0,
+        poll_interval: float = 2.0,
     ) -> dict[str, Any]:
         """Create a task run, then collect status, trace logs, task logs, and workspace zip bytes."""
         run = await self.create_async_run(agent_id, title=title, prompt=prompt)
         run_id = str(run.get("id") or run.get("task_id"))
         if not run_id:
             raise ValueError(f"create_async_run response did not include id: {run}")
+        status = await self.wait_for_run(
+            agent_id,
+            run_id,
+            timeout=wait_timeout,
+            poll_interval=poll_interval,
+        )
         return {
             "run": run,
-            "status": await self.get_run_status(agent_id, run_id),
+            "status": status,
             "task_logs": await self.get_run_logs(agent_id, run_id),
             "trace_logs": await self.get_run_trace(task_id=run_id),
             "workspace_zip": await self.export_workspace(agent_id, workspace_root),
@@ -382,6 +430,9 @@ class AgentApiClient:
 
     async def update_agent_tools(self, agent_id: str, updates: list[dict[str, Any]]) -> dict[str, Any]:
         return (await self._request("PUT", f"/api/tools/agents/{agent_id}", json=updates)).json()
+
+    async def get_agent_tools(self, agent_id: str) -> list[dict[str, Any]]:
+        return (await self._request("GET", f"/api/tools/agents/{agent_id}")).json()
 
     async def list_credentials(self, agent_id: str) -> list[dict[str, Any]]:
         return (await self._request("GET", f"/api/agents/{agent_id}/credentials/")).json()
