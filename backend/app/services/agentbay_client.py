@@ -836,29 +836,51 @@ Return ONLY valid JSON with this exact shape:
 When found is false, box_2d MUST be null.
 """.strip()
 
-    payload = {
-        "model": model_name,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{image_mime_type};base64,{image_base64}",
-                        },
-                    },
-                ],
-            }
-        ],
-        "temperature": 0,
-        "max_tokens": 512,
-        "response_format": {"type": "json_object"},
-    }
-    url = f"{base_url.rstrip('/')}/chat/completions"
     import httpx
 
+    if _is_gemini_native_models_base_url(base_url):
+        try:
+            payload = _build_gemini_native_grounding_payload(
+                prompt=prompt,
+                image_mime_type=image_mime_type,
+                image_base64=image_base64,
+            )
+            url = _gemini_native_generate_content_url(base_url, model_name)
+            async with httpx.AsyncClient(timeout=45.0, follow_redirects=True, proxy=None) as client:
+                response = await client.post(
+                    url,
+                    json=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "x-goog-api-key": api_key,
+                    },
+                )
+            if response.status_code >= 400:
+                raise RuntimeError(f"Grounding Gemini native API HTTP {response.status_code}: {response.text[:500]}")
+            native_result = _normalize_grounding_result(
+                _parse_grounding_json(_extract_gemini_native_content(response.json()) or "")
+            )
+            if not _grounding_result_has_usable_target(native_result):
+                raise RuntimeError(f"Grounding Gemini native API returned unusable target: {native_result}")
+            return native_result
+        except Exception as exc:
+            fallback_base_url = _fallback_openai_base_url_from_native_models_base_url(base_url)
+            if not fallback_base_url:
+                raise
+            logger.warning(
+                "[AgentBay] Gemini native grounding failed; falling back to OpenAI-compatible endpoint %s: %s",
+                fallback_base_url,
+                str(exc)[:300],
+            )
+            base_url = fallback_base_url
+
+    payload = _build_openai_compatible_grounding_payload(
+        model_name=model_name,
+        prompt=prompt,
+        image_mime_type=image_mime_type,
+        image_base64=image_base64,
+    )
+    url = f"{base_url.rstrip('/')}/chat/completions"
     async with httpx.AsyncClient(timeout=45.0, follow_redirects=True, proxy=None) as client:
         response = await client.post(
             url,
@@ -886,7 +908,143 @@ When found is false, box_2d MUST be null.
         if isinstance(data, dict)
         else ""
     )
-    return _parse_grounding_json(content or "")
+    return _normalize_grounding_result(_parse_grounding_json(content or ""))
+
+
+def _gemini_grounding_response_schema() -> dict[str, Any]:
+    return {
+        "type": "OBJECT",
+        "properties": {
+            "found": {"type": "BOOLEAN"},
+            "target": {"type": "STRING"},
+            "box_2d": {
+                "type": "ARRAY",
+                "items": {"type": "NUMBER"},
+                "nullable": True,
+            },
+            "confidence": {"type": "NUMBER"},
+            "reason": {"type": "STRING"},
+            "page_content": {"type": "STRING"},
+            "clarification": {"type": "STRING"},
+        },
+        "required": [
+            "found",
+            "target",
+            "box_2d",
+            "confidence",
+            "reason",
+            "page_content",
+            "clarification",
+        ],
+    }
+
+
+def _build_openai_compatible_grounding_payload(
+    *,
+    model_name: str,
+    prompt: str,
+    image_mime_type: str,
+    image_base64: str,
+) -> dict[str, Any]:
+    return {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{image_mime_type};base64,{image_base64}",
+                        },
+                    },
+                ],
+            }
+        ],
+        "temperature": 0,
+        "max_tokens": 512,
+        "response_format": {"type": "json_object"},
+    }
+
+
+def _build_gemini_native_grounding_payload(
+    *,
+    prompt: str,
+    image_mime_type: str,
+    image_base64: str,
+) -> dict[str, Any]:
+    return {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inlineData": {
+                            "mimeType": image_mime_type,
+                            "data": image_base64,
+                        }
+                    },
+                ],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0,
+            "maxOutputTokens": 512,
+            "responseMimeType": "application/json",
+            "responseSchema": _gemini_grounding_response_schema(),
+        },
+    }
+
+
+def _is_gemini_native_models_base_url(base_url: str) -> bool:
+    normalized = str(base_url or "").rstrip("/")
+    return normalized.endswith("/v1beta/models") or normalized.endswith("/v1/models")
+
+
+def _fallback_openai_base_url_from_native_models_base_url(base_url: str) -> str:
+    normalized = str(base_url or "").rstrip("/")
+    for suffix in ("/v1beta/models", "/v1/models"):
+        if normalized.endswith(suffix):
+            return normalized[: -len(suffix)] + "/v1"
+    return ""
+
+
+def _gemini_native_generate_content_url(base_url: str, model_name: str) -> str:
+    model_path = str(model_name or "").strip().lstrip("/")
+    if model_path.startswith("models/"):
+        model_path = model_path[len("models/") :]
+    return f"{base_url.rstrip('/')}/{model_path}:generateContent"
+
+
+def _extract_gemini_native_content(data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    candidates = data.get("candidates") or []
+    if not candidates or not isinstance(candidates[0], dict):
+        return ""
+    content = candidates[0].get("content") or {}
+    parts = content.get("parts") if isinstance(content, dict) else []
+    texts = []
+    if isinstance(parts, list):
+        for part in parts:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+    return "\n".join(texts)
+
+
+def _normalize_grounding_result(data: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(data)
+    if "target" not in normalized and isinstance(normalized.get("label"), str):
+        normalized["target"] = normalized["label"]
+    if "found" not in normalized:
+        box = normalized.get("box_2d")
+        normalized["found"] = isinstance(box, list) and len(box) == 4
+    for key in ("target", "reason", "page_content", "clarification"):
+        normalized.setdefault(key, "")
+    normalized.setdefault("confidence", None)
+    return normalized
 
 
 async def _resolve_grounding_openai_config(agent_id: uuid.UUID, action: str) -> tuple[str, str, str]:
@@ -935,6 +1093,13 @@ def _parse_grounding_json(content: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise RuntimeError(f"Gemini grounding returned non-object JSON: {data}")
     return data
+
+
+def _grounding_result_has_usable_target(grounding: dict[str, Any]) -> bool:
+    if _grounding_target_not_found(grounding):
+        return True
+    box = grounding.get("box_2d")
+    return isinstance(box, list) and len(box) == 4
 
 
 def _grounding_target_not_found(grounding: dict[str, Any]) -> bool:

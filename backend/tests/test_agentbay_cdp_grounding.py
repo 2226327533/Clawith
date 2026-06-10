@@ -11,8 +11,17 @@ sys.modules.setdefault("agentbay", fake_agentbay)
 
 from app.services.agentbay_client import (  # noqa: E402
     _build_browser_cdp_action_script,
+    _build_gemini_native_grounding_payload,
+    _build_openai_compatible_grounding_payload,
+    _extract_gemini_native_content,
+    _fallback_openai_base_url_from_native_models_base_url,
+    _gemini_grounding_response_schema,
+    _gemini_native_generate_content_url,
     _grounding_not_found_message,
+    _grounding_result_has_usable_target,
     _grounding_target_not_found,
+    _is_gemini_native_models_base_url,
+    _normalize_grounding_result,
     _normalized_box_center_to_pixel,
     _parse_cdp_action_result,
     _parse_grounding_json,
@@ -91,3 +100,78 @@ def test_grounding_target_not_found_message_includes_visible_page_summary():
     assert "Magento Admin login page" in message
     assert "Create Order button" in message
     assert "Navigate after login" in message
+
+
+def test_openai_compatible_grounding_payload_keeps_openai_json_mode():
+    payload = _build_openai_compatible_grounding_payload(
+        model_name="google/gemini-3.5-flash",
+        prompt="Find the search field",
+        image_mime_type="image/png",
+        image_base64="abcd",
+    )
+
+    assert payload["model"] == "google/gemini-3.5-flash"
+    assert payload["response_format"] == {"type": "json_object"}
+    assert "generationConfig" not in payload
+    image_part = payload["messages"][0]["content"][1]["image_url"]["url"]
+    assert image_part == "data:image/png;base64,abcd"
+
+
+def test_gemini_native_grounding_payload_uses_generation_config_schema():
+    payload = _build_gemini_native_grounding_payload(
+        prompt="Find the search field",
+        image_mime_type="image/png",
+        image_base64="abcd",
+    )
+
+    config = payload["generationConfig"]
+    assert config["responseMimeType"] == "application/json"
+    assert config["responseSchema"] == _gemini_grounding_response_schema()
+    assert config["maxOutputTokens"] == 512
+    assert payload["contents"][0]["parts"][1]["inlineData"] == {
+        "mimeType": "image/png",
+        "data": "abcd",
+    }
+    schema = config["responseSchema"]
+    assert schema["properties"]["box_2d"]["nullable"] is True
+    assert schema["required"] == [
+        "found",
+        "target",
+        "box_2d",
+        "confidence",
+        "reason",
+        "page_content",
+        "clarification",
+    ]
+
+
+def test_gemini_native_helpers_and_legacy_output_normalization():
+    assert _is_gemini_native_models_base_url("https://open.palebluedot.ai/v1beta/models")
+    assert _is_gemini_native_models_base_url("https://open.palebluedot.ai/v1/models/")
+    assert not _is_gemini_native_models_base_url("https://open.palebluedot.ai/v1")
+    assert _fallback_openai_base_url_from_native_models_base_url(
+        "https://open.palebluedot.ai/v1beta/models"
+    ) == "https://open.palebluedot.ai/v1"
+    assert _fallback_openai_base_url_from_native_models_base_url(
+        "https://open.palebluedot.ai/v1/models/"
+    ) == "https://open.palebluedot.ai/v1"
+    assert _gemini_native_generate_content_url(
+        "https://open.palebluedot.ai/v1beta/models",
+        "google/gemini-3.5-flash",
+    ) == "https://open.palebluedot.ai/v1beta/models/google/gemini-3.5-flash:generateContent"
+    assert _extract_gemini_native_content({
+        "candidates": [{"content": {"parts": [{"text": "{\"found\":true}"}]}}],
+    }) == "{\"found\":true}"
+
+    normalized = _normalize_grounding_result({
+        "point": [530, 517],
+        "label": "Sign In button",
+        "box_2d": [389, 344, 671, 690],
+    })
+    assert normalized["found"] is True
+    assert normalized["target"] == "Sign In button"
+    assert normalized["box_2d"] == [389, 344, 671, 690]
+    assert normalized["reason"] == ""
+    assert _grounding_result_has_usable_target(normalized) is True
+    assert _grounding_result_has_usable_target({"found": True}) is False
+    assert _grounding_result_has_usable_target({"found": False, "box_2d": None}) is True
