@@ -338,15 +338,7 @@ class AgentBayClient:
         except Exception:
             pass
 
-        if not getattr(run_result, "success", False):
-            raise RuntimeError(stderr or getattr(run_result, "error_message", "") or "CDP action failed")
-        try:
-            data = json.loads(stdout.strip().splitlines()[-1])
-        except Exception as exc:
-            raise RuntimeError(f"CDP action returned invalid JSON: stdout={stdout[:500]} stderr={stderr[:500]}") from exc
-        if not data.get("success"):
-            raise RuntimeError(data.get("error") or "CDP action failed")
-        return data
+        return _parse_cdp_action_result(run_result)
 
     async def browser_login(self, url: str, login_config: str) -> dict:
         """Perform an automated login using AgentBay's built-in login skill.
@@ -951,6 +943,30 @@ def _normalized_box_center_to_pixel(box: list[Any], width: int, height: int) -> 
     return ymin, xmin, ymax, xmax, x, y
 
 
+def _parse_cdp_action_result(run_result: Any) -> dict[str, Any]:
+    stdout = getattr(run_result, "stdout", "") or getattr(run_result, "output", "") or ""
+    stderr = getattr(run_result, "stderr", "") or ""
+    success = bool(getattr(run_result, "success", False))
+    error_message = getattr(run_result, "error_message", "") or ""
+    try:
+        data = json.loads(stdout.strip().splitlines()[-1])
+    except Exception as exc:
+        if not success:
+            raise RuntimeError(stderr or error_message or "CDP action failed") from exc
+        raise RuntimeError(f"CDP action returned invalid JSON: stdout={stdout[:500]} stderr={stderr[:500]}") from exc
+    if not success and data.get("success"):
+        logger.warning(
+            "[AgentBay] CDP action command reported failure but stdout contained success JSON: %s",
+            error_message or stderr,
+        )
+        return data
+    if not success:
+        raise RuntimeError(stderr or error_message or "CDP action failed")
+    if not data.get("success"):
+        raise RuntimeError(data.get("error") or "CDP action failed")
+    return data
+
+
 def _build_browser_cdp_action_script() -> str:
     """Return a Node.js Playwright script that operates the current AgentBay browser page."""
     return r"""
@@ -962,44 +978,57 @@ function decodePayload() {
 }
 
 (async () => {
-  const payload = decodePayload();
-  const browser = await chromium.connectOverCDP('http://localhost:9222');
-  const context = browser.contexts()[0];
-  if (!context) throw new Error('No browser context found');
-  const pages = context.pages();
-  const page = pages[pages.length - 1] || await context.newPage();
-  const x = Number(payload.x);
-  const y = Number(payload.y);
-  if (!Number.isFinite(x) || !Number.isFinite(y)) {
-    throw new Error('Invalid CDP coordinates');
-  }
-
-  await page.mouse.click(x, y);
-  await page.waitForTimeout(150);
-
-  if (payload.action === 'type') {
-    if (payload.replace !== false) {
-      await page.keyboard.press('Control+A');
-      await page.keyboard.press('Backspace');
+  let browser;
+  let exitCode = 0;
+  try {
+    const payload = decodePayload();
+    browser = await chromium.connectOverCDP('http://localhost:9222');
+    const context = browser.contexts()[0];
+    if (!context) throw new Error('No browser context found');
+    const pages = context.pages();
+    const page = pages[pages.length - 1] || await context.newPage();
+    const x = Number(payload.x);
+    const y = Number(payload.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      throw new Error('Invalid CDP coordinates');
     }
-    await page.keyboard.type(String(payload.text || ''), { delay: Number(payload.delay || 20) });
-  }
 
-  await page.waitForTimeout(300);
-  const title = await page.title().catch(() => '');
-  console.log(JSON.stringify({
-    success: true,
-    action: payload.action,
-    x,
-    y,
-    url: page.url(),
-    title
-  }));
-})().catch((e) => {
-  console.error(e && e.stack ? e.stack : String(e));
-  console.log(JSON.stringify({ success: false, error: e && e.message ? e.message : String(e) }));
-  process.exit(1);
-});
+    await page.mouse.click(x, y);
+    await page.waitForTimeout(150);
+
+    if (payload.action === 'type') {
+      if (payload.replace !== false) {
+        await page.keyboard.press('Control+A');
+        await page.keyboard.press('Backspace');
+      }
+      await page.keyboard.type(String(payload.text || ''), { delay: Number(payload.delay || 20) });
+    }
+
+    await page.waitForTimeout(300);
+    const title = await page.title().catch(() => '');
+    process.stdout.write(JSON.stringify({
+      success: true,
+      action: payload.action,
+      x,
+      y,
+      url: page.url(),
+      title
+    }) + '\n');
+  } catch (e) {
+    exitCode = 1;
+    console.error(e && e.stack ? e.stack : String(e));
+    process.stdout.write(JSON.stringify({ success: false, error: e && e.message ? e.message : String(e) }) + '\n');
+  } finally {
+    if (browser) {
+      const disconnectPromise = typeof browser.disconnect === 'function' ? browser.disconnect() : browser.close();
+      await Promise.race([
+        disconnectPromise,
+        new Promise((resolve) => setTimeout(resolve, 1000)),
+      ]).catch(() => {});
+    }
+    process.exit(exitCode);
+  }
+})();
 """
 
 

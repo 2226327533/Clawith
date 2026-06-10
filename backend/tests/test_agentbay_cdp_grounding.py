@@ -10,7 +10,9 @@ fake_agentbay.CreateSessionParams = object
 sys.modules.setdefault("agentbay", fake_agentbay)
 
 from app.services.agentbay_client import (  # noqa: E402
+    _build_browser_cdp_action_script,
     _normalized_box_center_to_pixel,
+    _parse_cdp_action_result,
     _parse_grounding_json,
 )
 
@@ -47,3 +49,25 @@ def test_normalized_box_center_to_pixel_clamps_to_image_bounds():
 
     assert x == 99
     assert y == 49
+
+
+def test_parse_cdp_action_result_accepts_success_stdout_after_timeout():
+    result = types.SimpleNamespace(
+        success=False,
+        stdout='{"success":true,"action":"click","x":10,"y":20}\n',
+        stderr="",
+        error_message="Command timed out",
+    )
+
+    data = _parse_cdp_action_result(result)
+
+    assert data["success"] is True
+    assert data["action"] == "click"
+
+
+def test_build_browser_cdp_action_script_disconnects_without_closing_remote_browser():
+    script = _build_browser_cdp_action_script()
+
+    assert "browser.disconnect" in script
+    assert "process.exit(exitCode)" in script
+    assert "Promise.race" in script
