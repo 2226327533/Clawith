@@ -370,6 +370,7 @@ async def _process_tool_call(
     full_reasoning_content: str,
     allowed_tool_names: set[str],
     on_code_output=None,
+    task_id: str | None = None,
 ) -> str:
     """Process a single tool call and return result."""
     fn = tc["function"]
@@ -386,6 +387,7 @@ async def _process_tool_call(
         agent_id=agent_id,
         user_id=user_id,
         session_id=session_id,
+        task_id=task_id,
         tool_name=tool_name,
         call_id=tc.get("id", ""),
         args=args,
@@ -447,6 +449,7 @@ async def _process_tool_call(
         agent_id=agent_id,
         user_id=user_id,
         session_id=session_id,
+        task_id=task_id,
         tool_name=tool_name,
         call_id=tc.get("id", ""),
         result=result,
@@ -510,6 +513,8 @@ async def call_llm(
     skip_tools: bool = False,
     on_code_output=None,
     current_user_name_override: str | None = None,
+    system_prompt_override: str | None = None,
+    task_id: str | None = None,
 ) -> str:
     """Call LLM via unified client with function-calling tool loop."""
     # Get agent config for tool rounds
@@ -543,10 +548,15 @@ async def call_llm(
                 )
         on_tool_call = _default_on_tool_call
 
-    # Build rich prompt with soul, memory, skills, relationships
-    from app.services.agent_context import build_agent_context
-    # Look up current user's display name so the agent knows who it's talking to
-    static_prompt, dynamic_prompt = await build_agent_context(agent_id, agent_name, role_description, current_user_name=_user_name)
+    # Build rich prompt with soul, memory, skills, relationships. Background task
+    # callers may pass an explicit prompt so they can still reuse this exact loop.
+    if system_prompt_override is not None:
+        static_prompt = system_prompt_override
+        dynamic_prompt = ""
+    else:
+        from app.services.agent_context import build_agent_context
+        # Look up current user's display name so the agent knows who it's talking to
+        static_prompt, dynamic_prompt = await build_agent_context(agent_id, agent_name, role_description, current_user_name=_user_name)
 
     # Load tools dynamically from DB. `skip_tools=True` is set by the WS
     # handler on the onboarding greeting turn; keep the runtime-level `finish`
@@ -611,6 +621,7 @@ async def call_llm(
             agent_id=agent_id,
             user_id=user_id,
             session_id=session_id,
+            task_id=task_id,
             provider=model.provider,
             model=model.model,
             round=round_i + 1,
@@ -651,6 +662,7 @@ async def call_llm(
             agent_id=agent_id,
             user_id=user_id,
             session_id=session_id,
+            task_id=task_id,
             provider=model.provider,
             model=model.model,
             round=round_i + 1,
@@ -687,6 +699,7 @@ async def call_llm(
                     agent_id=agent_id,
                     user_id=user_id,
                     session_id=session_id,
+                    task_id=task_id,
                     provider=model.provider,
                     model=model.model,
                     round=round_i + 1,
@@ -733,6 +746,7 @@ async def call_llm(
                 on_code_output=on_code_output,
                 full_reasoning_content=full_reasoning_content,
                 allowed_tool_names=allowed_tool_names,
+                task_id=task_id,
             )
             if tool_error:
                 api_messages.append(LLMMessage(
@@ -750,6 +764,7 @@ async def call_llm(
         agent_id=agent_id,
         user_id=user_id,
         session_id=session_id,
+        task_id=task_id,
         provider=model.provider,
         model=model.model,
         content="[Error] Too many tool call rounds",
@@ -776,6 +791,9 @@ async def call_llm_with_failover(
     skip_tools: bool = False,
     on_code_output=None,
     current_user_name_override: str | None = None,
+    max_tool_rounds_override: int | None = None,
+    system_prompt_override: str | None = None,
+    task_id: str | None = None,
 ) -> str:
     """Call LLM with automatic failover support."""
     guard = FailoverGuard()
@@ -818,6 +836,9 @@ async def call_llm_with_failover(
         skip_tools=skip_tools,
         on_code_output=on_code_output,
         current_user_name_override=current_user_name_override,
+        max_tool_rounds_override=max_tool_rounds_override,
+        system_prompt_override=system_prompt_override,
+        task_id=task_id,
     )
 
     # Check if we need to failover
@@ -882,6 +903,9 @@ async def call_llm_with_failover(
         skip_tools=skip_tools,
         on_code_output=on_code_output,
         current_user_name_override=current_user_name_override,
+        max_tool_rounds_override=max_tool_rounds_override,
+        system_prompt_override=system_prompt_override,
+        task_id=task_id,
     )
 
     # Combine error messages if fallback also failed
@@ -978,17 +1002,15 @@ async def call_agent_llm_with_tools(
     session_id: str = "",
     task_id: str | None = None,
 ) -> str:
-    """Call agent LLM with tool-calling loop (for background services)."""
+    """Run a background task through the same tool loop used by normal chat."""
     from app.models.agent import Agent
     from app.models.llm import LLMModel
 
-    # Load agent and models
     agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
     agent: Agent | None = agent_result.scalar_one_or_none()
     if not agent:
         return "⚠️ Agent not found"
 
-    # Load models
     primary_model: LLMModel | None = None
     if agent.primary_model_id:
         model_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
@@ -999,7 +1021,6 @@ async def call_agent_llm_with_tools(
         fb_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.fallback_model_id))
         fallback_model = fb_result.scalar_one_or_none()
 
-    # Config-level fallback
     if not primary_model and fallback_model:
         primary_model = fallback_model
         fallback_model = None
@@ -1007,221 +1028,26 @@ async def call_agent_llm_with_tools(
     if not primary_model:
         return f"⚠️ {agent.name} has no LLM model configured"
 
-    # Build messages
-    messages = [
-        LLMMessage(role="system", content=system_prompt),
-        LLMMessage(role="user", content=user_prompt),
-    ]
+    async def _background_tool_call_noop(_data: dict) -> None:
+        # Background tasks use structured agent_loop logs keyed by task_id/session_id.
+        # Avoid also writing task ids into the interactive chat history table.
+        return None
 
-    tools_for_llm = await get_agent_tools_for_llm(agent_id)
-    allowed_tool_names = _allowed_tool_names(tools_for_llm)
-
-    async def _try_model(model: LLMModel) -> tuple[str, bool, bool]:
-        """Try to complete with a model. Returns (response, success, tool_executed)."""
-        _accumulated_usage = TokenUsage()
-        tool_executed = False
-        try:
-            client = create_llm_client(
-                provider=model.provider,
-                api_key=get_model_api_key(model),
-                model=model.model,
-                base_url=model.base_url,
-                timeout=_get_model_timeout(model),
-            )
-
-            max_tokens = get_max_tokens(
-                model.provider, model.model,
-                getattr(model, 'max_output_tokens', None)
-            )
-
-            # Tool-calling loop
-            api_messages = list(messages)
-            for round_i in range(max_rounds):
-                _log_agent_loop(
-                    "prompt",
-                    agent_id=agent_id,
-                    user_id=agent.creator_id,
-                    session_id=session_id,
-                    task_id=task_id,
-                    provider=model.provider,
-                    model=model.model,
-                    round=round_i + 1,
-                    messages_count=len(api_messages),
-                    messages=_trace_messages(api_messages),
-                )
-                try:
-                    response = await client.complete(
-                        messages=api_messages,
-                        tools=tools_for_llm if tools_for_llm else None,
-                        temperature=model.temperature,
-                        max_tokens=max_tokens,
-                    )
-                except Exception as e:
-                    logger.error(f"[call_agent_llm_with_tools] Agent {agent_id}: LLM call error: {e}")
-                    await client.close()
-                    if agent_id and _accumulated_usage.total_tokens > 0:
-                        await record_token_usage(agent_id, _accumulated_usage)
-                    raise
-
-                _log_agent_loop(
-                    "response",
-                    agent_id=agent_id,
-                    user_id=agent.creator_id,
-                    session_id=session_id,
-                    task_id=task_id,
-                    provider=model.provider,
-                    model=model.model,
-                    round=round_i + 1,
-                    content=response.content,
-                    reasoning_content=response.reasoning_content,
-                    tool_calls=response.tool_calls,
-                    tool_calls_count=len(response.tool_calls or []),
-                    usage=response.usage,
-                )
-
-                # Track tokens for this round
-                _accumulated_usage.add(_usage_from_response_or_estimate(response, api_messages))
-
-                if not response.tool_calls:
-                    if response.content:
-                        api_messages.append(LLMMessage(role="assistant", content=response.content))
-                    api_messages.append(LLMMessage(role="user", content=FINISH_PROTOCOL_REMINDER))
-                    continue
-
-                # Execute tool calls
-                sanitized_tool_calls, retry_instruction = _sanitize_tool_calls_for_context(response.tool_calls)
-                if retry_instruction:
-                    api_messages.append(LLMMessage(role="user", content=retry_instruction))
-                    continue
-
-                finish_call = find_finish_call(sanitized_tool_calls)
-                if finish_call:
-                    if finish_call.valid:
-                        _log_agent_loop(
-                            "response",
-                            agent_id=agent_id,
-                            user_id=agent.creator_id,
-                            session_id=session_id,
-                            task_id=task_id,
-                            provider=model.provider,
-                            model=model.model,
-                            round=round_i + 1,
-                            content=finish_call.content,
-                            finish=True,
-                        )
-                        if agent_id and _accumulated_usage.total_tokens > 0:
-                            await record_token_usage(agent_id, _accumulated_usage)
-                        await client.close()
-                        return finish_call.content, True, tool_executed
-                    api_messages.append(LLMMessage(
-                        role="assistant",
-                        content=response.content or None,
-                        tool_calls=sanitized_tool_calls,
-                        reasoning_content=response.reasoning_content,
-                    ))
-                    api_messages.append(LLMMessage(
-                        role="tool",
-                        tool_call_id=finish_call.call_id,
-                        content=finish_call.error or "`finish` was invalid.",
-                    ))
-                    continue
-
-                api_messages.append(LLMMessage(
-                    role="assistant",
-                    content=response.content or None,
-                    tool_calls=sanitized_tool_calls,
-                    reasoning_content=response.reasoning_content,
-                ))
-
-                for tc in sanitized_tool_calls or []:
-                    fn = tc["function"]
-                    tool_name = fn["name"]
-                    raw_args = fn.get("arguments", "{}")
-                    try:
-                        args = parse_tool_arguments(raw_args)
-                    except json.JSONDecodeError:
-                        args = {}
-
-                    _log_agent_loop(
-                        "tool_call",
-                        agent_id=agent_id,
-                        user_id=agent.creator_id,
-                        session_id=session_id,
-                        task_id=task_id,
-                        tool_name=tool_name,
-                        call_id=tc.get("id", ""),
-                        args=args,
-                        raw_args=raw_args,
-                    )
-                    tool_executed = True
-                    if tool_name not in allowed_tool_names:
-                        logger.warning(f"[call_agent_llm_with_tools] Blocked disabled tool call: {tool_name} agent_id={agent_id}")
-                        result = _tool_not_enabled_message(tool_name)
-                    else:
-                        result = await execute_tool(
-                            tool_name, args,
-                            agent_id=agent_id,
-                            user_id=agent.creator_id,
-                            session_id=session_id,
-                        )
-                    _log_agent_loop(
-                        "tool_result",
-                        agent_id=agent_id,
-                        user_id=agent.creator_id,
-                        session_id=session_id,
-                        task_id=task_id,
-                        tool_name=tool_name,
-                        call_id=tc.get("id", ""),
-                        result=result,
-                    )
-                    api_messages.append(LLMMessage(
-                        role="tool",
-                        tool_call_id=tc["id"],
-                        content=str(result),
-                    ))
-
-            if agent_id and _accumulated_usage.total_tokens > 0:
-                await record_token_usage(agent_id, _accumulated_usage)
-            await client.close()
-            _log_agent_loop(
-                "response",
-                agent_id=agent_id,
-                user_id=agent.creator_id,
-                session_id=session_id,
-                task_id=task_id,
-                provider=model.provider,
-                model=model.model,
-                content="[Error] Too many tool call rounds",
-                error="too_many_tool_call_rounds",
-            )
-            return "[Error] Too many tool call rounds", False, tool_executed
-
-        except Exception as e:
-            if agent_id and _accumulated_usage.total_tokens > 0:
-                await record_token_usage(agent_id, _accumulated_usage)
-            return f"[Error] {e}", False, tool_executed
-
-    # Try primary model
-    reply, success, primary_tool_executed = await _try_model(primary_model)
-    if success:
-        return reply
-
-    # Primary failed - check if retryable
-    error_type = classify_error(Exception(reply))
-    if error_type == FailoverErrorType.NON_RETRYABLE or not fallback_model:
-        return reply
-
-    if primary_tool_executed:
-        logger.warning("[call_agent_llm_with_tools] Blocked fallback: side-effecting tool already executed")
-        return reply
-
-    # Try fallback model
-    logger.info(f"[call_agent_llm_with_tools] Retrying with fallback: {fallback_model.model}")
-    reply2, success2, _fallback_tool_executed = await _try_model(fallback_model)
-    if success2:
-        return reply2
-
-    return f"⚠️ Both models failed | Primary: {reply[:80]} | Fallback: {reply2[:80]}"
+    return await call_llm_with_failover(
+        primary_model=primary_model,
+        fallback_model=fallback_model,
+        messages=[{"role": "user", "content": user_prompt}],
+        agent_name=agent.name,
+        role_description=agent.role_description or "",
+        agent_id=agent_id,
+        user_id=agent.creator_id,
+        session_id=session_id,
+        on_tool_call=_background_tool_call_noop,
+        supports_vision=getattr(primary_model, "supports_vision", False),
+        max_tool_rounds_override=max_rounds,
+        system_prompt_override=system_prompt,
+        task_id=task_id,
+    )
 
 
 __all__ = [

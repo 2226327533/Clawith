@@ -16,6 +16,10 @@ from tests.utils import agent_api_client as client_module
 from tests.utils.agent_api_client import AgentApiClient
 
 
+async def _async_return(value):
+    return value
+
+
 def _response(method: str, path: str, *, json_payload=None, content: bytes | None = None, status_code: int = 200):
     request = httpx.Request(method, f"http://test{path}")
     if content is not None:
@@ -301,7 +305,11 @@ async def test_call_agent_llm_with_tools_logs_task_id(monkeypatch):
             return FakeResult(self.values.pop(0))
 
     class FakeClient:
-        async def complete(self, **_kwargs):
+        def __init__(self):
+            self.messages_seen = []
+
+        async def stream(self, *, messages, **_kwargs):
+            self.messages_seen.append(list(messages))
             return SimpleNamespace(
                 content="",
                 reasoning_content=None,
@@ -333,6 +341,7 @@ async def test_call_agent_llm_with_tools_logs_task_id(monkeypatch):
         creator_id=creator_id,
         primary_model_id=model_id,
         fallback_model_id=None,
+        role_description="",
     )
     fake_model = SimpleNamespace(
         provider="openai",
@@ -341,14 +350,18 @@ async def test_call_agent_llm_with_tools_logs_task_id(monkeypatch):
         temperature=None,
         max_output_tokens=None,
         request_timeout=None,
+        supports_vision=True,
     )
+    fake_client = FakeClient()
 
     monkeypatch.setattr(caller, "_log_agent_loop", lambda event, **fields: logged.append((event, fields)))
+    monkeypatch.setattr(caller, "_get_agent_config", lambda _agent_id: _async_return((50, None)))
+    monkeypatch.setattr(caller, "_get_user_name", lambda _user_id: _async_return(None))
     async def fake_get_agent_tools_for_llm(*_args, **_kwargs):
         return []
 
     monkeypatch.setattr(caller, "get_agent_tools_for_llm", fake_get_agent_tools_for_llm)
-    monkeypatch.setattr(caller, "create_llm_client", lambda **_kwargs: FakeClient())
+    monkeypatch.setattr(caller, "create_llm_client", lambda **_kwargs: fake_client)
     monkeypatch.setattr(caller, "get_model_api_key", lambda _model: "test-key")
     monkeypatch.setattr(caller, "get_max_tokens", lambda *_args, **_kwargs: 16)
 
@@ -368,6 +381,8 @@ async def test_call_agent_llm_with_tools_logs_task_id(monkeypatch):
     )
 
     assert reply == "done"
+    assert fake_client.messages_seen[0][0].content == "system"
+    assert fake_client.messages_seen[0][1].content == "user"
     prompt_or_response = [fields for event, fields in logged if event in {"prompt", "response"}]
     assert prompt_or_response
     assert all(fields["task_id"] == task_id for fields in prompt_or_response)
