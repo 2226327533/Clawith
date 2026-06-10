@@ -1761,6 +1761,36 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "agentbay_browser_cdp_click",
+            "description": "在 AgentBay 浏览器中使用 Gemini 视觉 grounding 定位自然语言目标，然后通过 Playwright/CDP 精确点击。instruction 必须描述当前截图中要点击的元素，例如 '购物车按钮'、'Add to Cart button'、'页面顶部搜索图标'。工具会把带 CDP 点击坐标和 grounding 框的截图保存到 workspace/screenshots/，便于下载和复盘。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "instruction": {"type": "string", "description": "自然语言点击目标描述，例如 'the blue Submit button' 或 '商品页面的 Add to Cart 按钮'"},
+                },
+                "required": ["instruction"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "agentbay_browser_cdp_type",
+            "description": "在 AgentBay 浏览器中使用 Gemini 视觉 grounding 定位自然语言输入目标，然后通过 Playwright/CDP 点击并输入文本。instruction 必须描述当前截图中的输入框或可编辑区域。工具会把带 CDP 点击坐标和 grounding 框的截图保存到 workspace/screenshots/，便于下载和复盘。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "instruction": {"type": "string", "description": "自然语言输入目标描述，例如 'search box at the top of the page' 或 '手机号输入框'"},
+                    "text": {"type": "string", "description": "要输入的文本"},
+                    "replace": {"type": "boolean", "description": "是否先清空当前字段再输入，默认 true"},
+                },
+                "required": ["instruction", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "agentbay_browser_login",
             "description": "Use AgentBay's AI-driven login skill to automate complex login flows (CAPTCHAs, OTP, multi-step auth). Requires a login_config JSON with AgentBay skill credentials. Navigate to the login page and execute the login skill.",
             "parameters": {
@@ -3218,6 +3248,10 @@ async def execute_tool(
             result = await _agentbay_browser_click(agent_id, ws, arguments)
         elif tool_name == "agentbay_browser_type":
             result = await _agentbay_browser_type(agent_id, ws, arguments)
+        elif tool_name == "agentbay_browser_cdp_click":
+            result = await _agentbay_browser_cdp_click(agent_id, ws, arguments)
+        elif tool_name == "agentbay_browser_cdp_type":
+            result = await _agentbay_browser_cdp_type(agent_id, ws, arguments)
         elif tool_name == "agentbay_code_execute":
             result = await _agentbay_code_execute(agent_id, ws, arguments)
         elif tool_name == "agentbay_code_write_file":
@@ -11408,7 +11442,7 @@ def _agentbay_save_image_to_workspace(
     """Save an explicitly requested screenshot under workspace/screenshots/."""
     import time as _time
 
-    rel_path = f"workspace/screenshots/{prefix}-{int(_time.time())}.png"
+    rel_path = f"workspace/screenshots/{prefix}-{int(_time.time())}-{uuid.uuid4().hex[:8]}.png"
     screenshot_path = ws / rel_path
     screenshot_path.parent.mkdir(parents=True, exist_ok=True)
     screenshot_path.write_bytes(raw_bytes)
@@ -11416,6 +11450,117 @@ def _agentbay_save_image_to_workspace(
     return (
         f"Screenshot saved to `{rel_path}`.\n"
         f"![{label}](/api/agents/{agent_id}/files/download?path={rel_path})"
+    )
+
+
+def _agentbay_render_cdp_coordinate_screenshot(result: dict[str, Any]) -> bytes | None:
+    """Render the CDP target point and grounding box onto the screenshot."""
+    raw_bytes = _agentbay_normalize_image_bytes(result.get("screenshot"))
+    if not raw_bytes:
+        return None
+
+    from io import BytesIO as _BytesIO
+    from PIL import Image, ImageDraw, ImageFont
+
+    try:
+        with Image.open(_BytesIO(raw_bytes)) as source:
+            image = source.convert("RGB")
+    except Exception:
+        return None
+
+    draw = ImageDraw.Draw(image)
+    width, height = image.size
+    x = int(result.get("x") or 0)
+    y = int(result.get("y") or 0)
+    x = max(0, min(width - 1, x))
+    y = max(0, min(height - 1, y))
+
+    # Gemini grounding boxes are [ymin, xmin, ymax, xmax] normalized to 0-1000.
+    box = result.get("box_2d") or []
+    if isinstance(box, list) and len(box) == 4:
+        try:
+            ymin, xmin, ymax, xmax = [float(v) for v in box]
+            left = int(round(xmin / 1000.0 * width))
+            top = int(round(ymin / 1000.0 * height))
+            right = int(round(xmax / 1000.0 * width))
+            bottom = int(round(ymax / 1000.0 * height))
+            draw.rectangle(
+                [max(0, left), max(0, top), min(width - 1, right), min(height - 1, bottom)],
+                outline=(255, 0, 0),
+                width=4,
+            )
+        except Exception:
+            pass
+
+    radius = max(10, min(width, height) // 80)
+    draw.line([(max(0, x - radius * 2), y), (min(width - 1, x + radius * 2), y)], fill=(255, 0, 0), width=4)
+    draw.line([(x, max(0, y - radius * 2)), (x, min(height - 1, y + radius * 2))], fill=(255, 0, 0), width=4)
+    draw.ellipse([x - radius, y - radius, x + radius, y + radius], outline=(255, 0, 0), width=5)
+
+    label = f"CDP target ({x}, {y})"
+    target = str(result.get("target") or "").strip()
+    if target:
+        label += f" - {target[:80]}"
+    font = ImageFont.load_default()
+    try:
+        bbox = draw.textbbox((0, 0), label, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+    except Exception:
+        text_w = min(width - 20, len(label) * 7)
+        text_h = 14
+    label_x = min(max(8, x + radius + 8), max(8, width - text_w - 18))
+    label_y = min(max(8, y - radius - text_h - 12), max(8, height - text_h - 18))
+    draw.rectangle(
+        [label_x - 6, label_y - 5, label_x + text_w + 6, label_y + text_h + 6],
+        fill=(255, 255, 255),
+        outline=(255, 0, 0),
+        width=2,
+    )
+    draw.text((label_x, label_y), label, fill=(180, 0, 0), font=font)
+
+    out = _BytesIO()
+    image.save(out, format="PNG")
+    return out.getvalue()
+
+
+def _agentbay_save_cdp_coordinate_screenshot(
+    *,
+    agent_id: uuid.UUID,
+    ws: Path,
+    result: dict[str, Any],
+    prefix: str,
+    session_id: str = "",
+    tool_name: str = "",
+) -> str:
+    rendered = _agentbay_render_cdp_coordinate_screenshot(result)
+    if not rendered:
+        return "CDP coordinate screenshot was not saved because the screenshot payload could not be decoded."
+    if session_id and tool_name:
+        _agentbay_record_eval_screenshot(
+            agent_id=agent_id,
+            session_id=session_id,
+            tool_name=tool_name,
+            image_id=str(uuid.uuid4()),
+            raw_bytes=rendered,
+            metadata={
+                "source": "agentbay_cdp_grounding",
+                "action": result.get("action"),
+                "instruction": result.get("instruction"),
+                "target": result.get("target"),
+                "box_2d": result.get("box_2d"),
+                "x": result.get("x"),
+                "y": result.get("y"),
+                "success": result.get("success"),
+                "error": result.get("error"),
+            },
+        )
+    return _agentbay_save_image_to_workspace(
+        agent_id=agent_id,
+        ws=ws,
+        raw_bytes=rendered,
+        prefix=prefix,
+        label="AgentBay CDP Target",
     )
 
 
@@ -11652,6 +11797,97 @@ async def _agentbay_browser_type(agent_id: Optional[uuid.UUID], ws: Path, argume
     except Exception as e:
         logger.exception(f"[AgentBay] Browser type failed")
         return f"❌ 输入失败: {str(e)[:200]}"
+
+
+async def _agentbay_browser_cdp_click(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:
+    """AgentBay 浏览器 Gemini grounding + CDP 点击。"""
+    if not agent_id:
+        return "❌ AgentBay 工具需要 agent 上下文"
+
+    from app.services.agentbay_client import get_agentbay_client_for_agent
+
+    instruction = arguments.get("instruction", "")
+    if not instruction:
+        return "❌ instruction 不能为空"
+
+    try:
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
+        result = await client.browser_cdp_click(agent_id, instruction)
+        screenshot_info = _agentbay_save_cdp_coordinate_screenshot(
+            agent_id=agent_id,
+            ws=ws,
+            result=result,
+            prefix="browser-cdp-click",
+            session_id=_session_id,
+            tool_name="agentbay_browser_cdp_click",
+        )
+        if not result.get("success"):
+            return (
+                f"❌ CDP 点击失败: {result.get('error', 'unknown error')}\n"
+                f"target={result.get('target', '')}\n"
+                f"box_2d={result.get('box_2d')} pixel=({result.get('x')}, {result.get('y')})\n"
+                f"{screenshot_info}"
+            )
+        return (
+            f"✅ CDP 点击完成: {instruction}\n"
+            f"target={result.get('target', '')}\n"
+            f"box_2d={result.get('box_2d')} pixel=({result.get('x')}, {result.get('y')})\n"
+            f"url={result.get('cdp_result', {}).get('url', '')}\n"
+            f"{screenshot_info}"
+        )
+    except RuntimeError as e:
+        return f"❌ {str(e)}"
+    except Exception as e:
+        logger.exception("[AgentBay] Browser CDP click failed")
+        return f"❌ CDP 点击失败: {str(e)[:200]}"
+
+
+async def _agentbay_browser_cdp_type(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:
+    """AgentBay 浏览器 Gemini grounding + CDP 输入。"""
+    if not agent_id:
+        return "❌ AgentBay 工具需要 agent 上下文"
+
+    from app.services.agentbay_client import get_agentbay_client_for_agent
+
+    instruction = arguments.get("instruction", "")
+    text = arguments.get("text", "")
+    replace_raw = arguments.get("replace", True)
+    replace = str(replace_raw).strip().lower() not in {"false", "0", "no"} if isinstance(replace_raw, str) else bool(replace_raw)
+    if not instruction:
+        return "❌ instruction 不能为空"
+
+    try:
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
+        result = await client.browser_cdp_type(agent_id, instruction, text, replace=replace)
+        screenshot_info = _agentbay_save_cdp_coordinate_screenshot(
+            agent_id=agent_id,
+            ws=ws,
+            result=result,
+            prefix="browser-cdp-type",
+            session_id=_session_id,
+            tool_name="agentbay_browser_cdp_type",
+        )
+        if not result.get("success"):
+            return (
+                f"❌ CDP 输入失败: {result.get('error', 'unknown error')}\n"
+                f"target={result.get('target', '')}\n"
+                f"box_2d={result.get('box_2d')} pixel=({result.get('x')}, {result.get('y')})\n"
+                f"{screenshot_info}"
+            )
+        return (
+            f"✅ CDP 输入完成: {instruction}\n"
+            f"target={result.get('target', '')}\n"
+            f"box_2d={result.get('box_2d')} pixel=({result.get('x')}, {result.get('y')})\n"
+            f"url={result.get('cdp_result', {}).get('url', '')}\n"
+            f"{screenshot_info}"
+        )
+    except RuntimeError as e:
+        return f"❌ {str(e)}"
+    except Exception as e:
+        logger.exception("[AgentBay] Browser CDP type failed")
+        return f"❌ CDP 输入失败: {str(e)[:200]}"
 
 
 async def _agentbay_code_execute(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:

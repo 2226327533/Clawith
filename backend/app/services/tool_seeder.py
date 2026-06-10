@@ -23,6 +23,8 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "agentbay_browser_save_screenshot",
     "agentbay_browser_click",
     "agentbay_browser_type",
+    "agentbay_browser_cdp_click",
+    "agentbay_browser_cdp_type",
     "agentbay_browser_extract",
     "agentbay_browser_observe",
     "agentbay_browser_login",
@@ -2599,6 +2601,54 @@ AGENTBAY_TOOLS = [
         "config_schema": {},
     },
     {
+        "name": "agentbay_browser_cdp_click",
+        "display_name": "AgentBay: Browser CDP Click",
+        "description": "[ENV: Browser] Use Gemini visual grounding on the current browser screenshot to locate a natural-language target, then click it through Playwright/CDP. Saves an annotated screenshot with the grounding box and clicked coordinate under workspace/screenshots/ for download and debugging. This is deterministic CDP control, not AgentBay BrowserOperator act().",
+        "category": "agentbay",
+        "icon": "◎",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "instruction": {"type": "string", "description": "Natural-language click target, e.g. 'the blue Submit button' or 'Add to Cart button'"},
+            },
+            "required": ["instruction"],
+        },
+        "config": {},
+        "config_schema": {
+            "fields": [
+                {"key": "api_key", "label": "OpenAI API Key", "type": "password", "default": ""},
+                {"key": "base_url", "label": "OpenAI Base URL", "type": "text", "default": "https://api.openai.com/v1"},
+                {"key": "model_name", "label": "Grounding Model", "type": "text", "default": "gemini-3.5-flash"},
+            ]
+        },
+    },
+    {
+        "name": "agentbay_browser_cdp_type",
+        "display_name": "AgentBay: Browser CDP Type",
+        "description": "[ENV: Browser] Use Gemini visual grounding on the current browser screenshot to locate a natural-language input target, then click and type through Playwright/CDP. Saves an annotated screenshot with the grounding box and typed coordinate under workspace/screenshots/ for download and debugging. This is deterministic CDP control, not AgentBay BrowserOperator act().",
+        "category": "agentbay",
+        "icon": "◎",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "instruction": {"type": "string", "description": "Natural-language input target, e.g. 'search box at the top of the page' or 'phone number input'"},
+                "text": {"type": "string", "description": "Text to type"},
+                "replace": {"type": "boolean", "description": "Clear the target field before typing. Defaults to true."},
+            },
+            "required": ["instruction", "text"],
+        },
+        "config": {},
+        "config_schema": {
+            "fields": [
+                {"key": "api_key", "label": "OpenAI API Key", "type": "password", "default": ""},
+                {"key": "base_url", "label": "OpenAI Base URL", "type": "text", "default": "https://api.openai.com/v1"},
+                {"key": "model_name", "label": "Grounding Model", "type": "text", "default": "gemini-3.5-flash"},
+            ]
+        },
+    },
+    {
         "name": "agentbay_code_execute",
         "display_name": "AgentBay: Code Execute",
         "description": "[ENV: Code Sandbox] Execute code (Python, Bash, Node.js) in the AgentBay Code Sandbox. IMPORTANT: This sandbox is an ISOLATED environment — it does NOT share filesystem, processes, or network with the Headless Browser (browser_* tools) or Cloud Desktop (computer_* tools). Files created here are NOT accessible from other environments.",
@@ -3587,7 +3637,11 @@ async def seed_builtin_tools():
             "agentbay_browser_navigate",
             "agentbay_browser_screenshot",
         ]
-        browser_helper_names = ["agentbay_browser_save_screenshot"]
+        browser_helper_names = [
+            "agentbay_browser_save_screenshot",
+            "agentbay_browser_cdp_click",
+            "agentbay_browser_cdp_type",
+        ]
         browser_anchor_tools_r = await db.execute(select(Tool.id).where(Tool.name.in_(browser_anchor_names)))
         browser_anchor_tool_ids = [row[0] for row in browser_anchor_tools_r.fetchall()]
         browser_helper_tools_r = await db.execute(select(Tool).where(Tool.name.in_(browser_helper_names)))

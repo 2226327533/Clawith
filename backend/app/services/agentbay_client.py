@@ -4,11 +4,18 @@ This module provides a client wrapper around the official AgentBay SDK
 for browser and code execution operations.
 """
 
+from __future__ import annotations
+
 import asyncio
+import base64
+import json
+import re
+import shlex
 import uuid
+from io import BytesIO
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 from loguru import logger
 
 from agentbay import AgentBay, CreateSessionParams
@@ -203,6 +210,143 @@ class AgentBayClient:
 
         await asyncio.to_thread(self._session.browser.operator.act, ActOptions(action=action_msg))
         return {"success": True, "selector": selector, "text": text}
+
+    async def browser_cdp_click(self, agent_id: uuid.UUID, instruction: str) -> dict:
+        """Use Gemini visual grounding to click a natural-language target via CDP."""
+        await self._ensure_browser_initialized()
+        plan = await self._ground_browser_target_with_gemini(
+            agent_id=agent_id,
+            instruction=instruction,
+            action="click",
+        )
+        try:
+            result = await self._run_browser_cdp_action(
+                {
+                    "action": "click",
+                    "x": plan["x"],
+                    "y": plan["y"],
+                }
+            )
+            return {**plan, "success": True, "cdp_result": result}
+        except Exception as exc:
+            return {**plan, "success": False, "error": str(exc)}
+
+    async def browser_cdp_type(self, agent_id: uuid.UUID, instruction: str, text: str, replace: bool = True) -> dict:
+        """Use Gemini visual grounding to type into a natural-language target via CDP."""
+        await self._ensure_browser_initialized()
+        plan = await self._ground_browser_target_with_gemini(
+            agent_id=agent_id,
+            instruction=instruction,
+            action="type",
+        )
+        try:
+            result = await self._run_browser_cdp_action(
+                {
+                    "action": "type",
+                    "x": plan["x"],
+                    "y": plan["y"],
+                    "text": text,
+                    "replace": replace,
+                    "delay": 20,
+                }
+            )
+            return {**plan, "success": True, "text": text, "replace": replace, "cdp_result": result}
+        except Exception as exc:
+            return {**plan, "success": False, "text": text, "replace": replace, "error": str(exc)}
+
+    async def _ground_browser_target_with_gemini(
+        self,
+        *,
+        agent_id: uuid.UUID,
+        instruction: str,
+        action: str,
+    ) -> dict:
+        """Ground a natural-language browser action target to pixel coordinates."""
+        screenshot_data = await asyncio.to_thread(
+            self._session.browser.operator.screenshot, full_page=False
+        )
+        mime_type, b64_data, width, height = self._parse_screenshot_data_url(screenshot_data)
+        grounding = await _gemini_ground_browser_target(
+            agent_id=agent_id,
+            image_mime_type=mime_type,
+            image_base64=b64_data,
+            image_width=width,
+            image_height=height,
+            action=action,
+            instruction=instruction,
+        )
+
+        box = grounding.get("box_2d")
+        if not (isinstance(box, list) and len(box) == 4):
+            raise RuntimeError(f"Gemini grounding did not return a valid box_2d: {grounding}")
+
+        ymin, xmin, ymax, xmax, x, y = _normalized_box_center_to_pixel(box, width, height)
+
+        return {
+            "instruction": instruction,
+            "action": action,
+            "screenshot": screenshot_data,
+            "box_2d": [int(round(v)) for v in (ymin, xmin, ymax, xmax)],
+            "x": x,
+            "y": y,
+            "image_width": width,
+            "image_height": height,
+            "target": grounding.get("target") or grounding.get("label") or "",
+            "confidence": grounding.get("confidence"),
+            "reason": grounding.get("reason") or "",
+        }
+
+    def _parse_screenshot_data_url(self, screenshot_data: str) -> tuple[str, str, int, int]:
+        """Return (mime_type, base64, width, height) from an AgentBay screenshot data URL."""
+        match = re.match(r"^data:([^;]+);base64,(.+)$", screenshot_data or "", re.DOTALL)
+        if not match:
+            raise RuntimeError("AgentBay screenshot did not return a base64 data URL")
+        mime_type = match.group(1)
+        b64_data = match.group(2).strip()
+        try:
+            raw = base64.b64decode(b64_data)
+            from PIL import Image
+
+            with Image.open(BytesIO(raw)) as image:
+                width, height = image.size
+        except Exception as exc:
+            raise RuntimeError(f"Could not decode AgentBay screenshot: {exc}") from exc
+        if width <= 0 or height <= 0:
+            raise RuntimeError(f"Invalid AgentBay screenshot size: {width}x{height}")
+        return mime_type, b64_data, width, height
+
+    async def _run_browser_cdp_action(self, payload: dict[str, Any]) -> dict:
+        """Run a Playwright CDP action inside the AgentBay browser session."""
+        script_name = f"clawith_cdp_action_{uuid.uuid4().hex}.js"
+        script = _build_browser_cdp_action_script()
+        script_b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        payload_b64 = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
+
+        write_cmd = f"printf %s {shlex.quote(script_b64)} | /usr/bin/base64 -d > {shlex.quote(script_name)}"
+        write_result = await asyncio.to_thread(self._session.command.exec, write_cmd, timeout_ms=15000)
+        if not getattr(write_result, "success", False):
+            stderr = getattr(write_result, "stderr", "") or getattr(write_result, "error_message", "")
+            raise RuntimeError(f"Failed to write CDP action script in AgentBay: {stderr}")
+
+        run_cmd = f"node {shlex.quote(script_name)} {shlex.quote(payload_b64)}"
+        run_result = await asyncio.to_thread(self._session.command.exec, run_cmd, timeout_ms=30000)
+        stdout = getattr(run_result, "stdout", "") or getattr(run_result, "output", "") or ""
+        stderr = getattr(run_result, "stderr", "") or ""
+        cleanup_cmd = f"rm -f {shlex.quote(script_name)}"
+        try:
+            await asyncio.to_thread(self._session.command.exec, cleanup_cmd, timeout_ms=5000)
+        except Exception:
+            pass
+
+        if not getattr(run_result, "success", False):
+            raise RuntimeError(stderr or getattr(run_result, "error_message", "") or "CDP action failed")
+        try:
+            data = json.loads(stdout.strip().splitlines()[-1])
+        except Exception as exc:
+            raise RuntimeError(f"CDP action returned invalid JSON: stdout={stdout[:500]} stderr={stderr[:500]}") from exc
+        if not data.get("success"):
+            raise RuntimeError(data.get("error") or "CDP action failed")
+        return data
 
     async def browser_login(self, url: str, login_config: str) -> dict:
         """Perform an automated login using AgentBay's built-in login skill.
@@ -648,6 +792,215 @@ class AgentBayClient:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close_session()
+
+
+async def _gemini_ground_browser_target(
+    *,
+    agent_id: uuid.UUID,
+    image_mime_type: str,
+    image_base64: str,
+    image_width: int,
+    image_height: int,
+    action: str,
+    instruction: str,
+) -> dict[str, Any]:
+    """Call an OpenAI-compatible Gemini endpoint for visual grounding."""
+    api_key, base_url, model_name = await _resolve_grounding_openai_config(agent_id, action)
+    action_hint = (
+        "clickable element/button/link/control"
+        if action == "click"
+        else "editable input/textarea/search box/content field"
+    )
+    prompt = f"""
+You are a precise browser UI visual grounding engine.
+
+Task:
+- Find the single best {action_hint} for this action: {action}
+- User natural-language target: {instruction}
+
+Gemini visual grounding coordinate rules:
+- Return a bounding box in normalized image coordinates from 0 to 1000.
+- The box order MUST be [ymin, xmin, ymax, xmax].
+- The box should tightly cover the actionable target. Prefer the smallest actual clickable/editable element.
+- For text input, target the editable field itself, not just its label.
+- If the target is partially visible, box the visible actionable region.
+
+Screenshot size for reference: {image_width}x{image_height} pixels.
+
+Return ONLY valid JSON with this exact shape:
+{{
+  "target": "short description of the selected UI target",
+  "box_2d": [ymin, xmin, ymax, xmax],
+  "confidence": 0.0,
+  "reason": "short reason"
+}}
+""".strip()
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{image_mime_type};base64,{image_base64}",
+                        },
+                    },
+                ],
+            }
+        ],
+        "temperature": 0,
+        "max_tokens": 512,
+        "response_format": {"type": "json_object"},
+    }
+    url = f"{base_url.rstrip('/')}/chat/completions"
+    import httpx
+
+    async with httpx.AsyncClient(timeout=45.0, follow_redirects=True, proxy=None) as client:
+        response = await client.post(
+            url,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        if response.status_code >= 400 and "response_format" in response.text:
+            payload.pop("response_format", None)
+            response = await client.post(
+                url,
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+            )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Grounding OpenAI API HTTP {response.status_code}: {response.text[:500]}")
+    data = response.json()
+    content = (
+        ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+        if isinstance(data, dict)
+        else ""
+    )
+    return _parse_grounding_json(content or "")
+
+
+async def _resolve_grounding_openai_config(agent_id: uuid.UUID, action: str) -> tuple[str, str, str]:
+    """Resolve OpenAI-compatible grounding config from the CDP tool config."""
+    from app.services.agent_tools import _get_tool_config
+
+    tool_name = "agentbay_browser_cdp_type" if action == "type" else "agentbay_browser_cdp_click"
+    config = await _get_tool_config(agent_id, tool_name) or {}
+    api_key = str(config.get("api_key") or "").strip()
+    base_url = str(config.get("base_url") or "").strip()
+    model_name = str(config.get("model_name") or config.get("model") or "").strip()
+
+    if not api_key or not base_url or not model_name:
+        missing = [
+            name
+            for name, value in {
+                "api_key": api_key,
+                "base_url": base_url,
+                "model_name": model_name,
+            }.items()
+            if not value
+        ]
+        raise RuntimeError(
+            f"{tool_name} grounding config missing: {', '.join(missing)}. "
+            "The evaluation platform should write per-agent tool config when creating the agent."
+        )
+    if base_url.rstrip("/").endswith("/chat/completions"):
+        base_url = base_url.rstrip("/")[: -len("/chat/completions")]
+    if base_url.rstrip("/").endswith("/v1"):
+        return api_key, base_url.rstrip("/"), model_name
+    return api_key, base_url.rstrip("/"), model_name
+
+
+def _parse_grounding_json(content: str) -> dict[str, Any]:
+    text = (content or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            raise RuntimeError(f"Gemini grounding returned non-JSON content: {content[:300]}")
+        data = json.loads(match.group(0))
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Gemini grounding returned non-object JSON: {data}")
+    return data
+
+
+def _normalized_box_center_to_pixel(box: list[Any], width: int, height: int) -> tuple[float, float, float, float, int, int]:
+    """Convert Gemini [ymin, xmin, ymax, xmax] 0-1000 box to a clamped pixel center."""
+    try:
+        ymin, xmin, ymax, xmax = [float(v) for v in box]
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"Gemini grounding returned non-numeric box_2d: {box}") from exc
+
+    x = int(round(((xmin + xmax) / 2.0) / 1000.0 * width))
+    y = int(round(((ymin + ymax) / 2.0) / 1000.0 * height))
+    x = max(0, min(width - 1, x))
+    y = max(0, min(height - 1, y))
+    return ymin, xmin, ymax, xmax, x, y
+
+
+def _build_browser_cdp_action_script() -> str:
+    """Return a Node.js Playwright script that operates the current AgentBay browser page."""
+    return r"""
+const { chromium } = require('/usr/local/lib/node_modules/playwright');
+
+function decodePayload() {
+  const arg = process.argv[2] || '';
+  return JSON.parse(Buffer.from(arg, 'base64').toString('utf8'));
+}
+
+(async () => {
+  const payload = decodePayload();
+  const browser = await chromium.connectOverCDP('http://localhost:9222');
+  const context = browser.contexts()[0];
+  if (!context) throw new Error('No browser context found');
+  const pages = context.pages();
+  const page = pages[pages.length - 1] || await context.newPage();
+  const x = Number(payload.x);
+  const y = Number(payload.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    throw new Error('Invalid CDP coordinates');
+  }
+
+  await page.mouse.click(x, y);
+  await page.waitForTimeout(150);
+
+  if (payload.action === 'type') {
+    if (payload.replace !== false) {
+      await page.keyboard.press('Control+A');
+      await page.keyboard.press('Backspace');
+    }
+    await page.keyboard.type(String(payload.text || ''), { delay: Number(payload.delay || 20) });
+  }
+
+  await page.waitForTimeout(300);
+  const title = await page.title().catch(() => '');
+  console.log(JSON.stringify({
+    success: true,
+    action: payload.action,
+    x,
+    y,
+    url: page.url(),
+    title
+  }));
+})().catch((e) => {
+  console.error(e && e.stack ? e.stack : String(e));
+  console.log(JSON.stringify({ success: false, error: e && e.message ? e.message : String(e) }));
+  process.exit(1);
+});
+"""
 
 
 # ─── Session Cache for Tool Executions ──────────────────────────
