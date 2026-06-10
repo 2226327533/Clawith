@@ -359,6 +359,39 @@ def _tool_not_enabled_message(tool_name: str) -> str:
     )
 
 
+def _split_tool_result_and_vision_message(
+    tool_name: str,
+    result_text: str,
+    vision_content: list,
+) -> tuple[str, LLMMessage | None]:
+    # Keep tool output textual and send screenshots as a follow-up user vision message.
+    tool_text = result_text
+    image_parts: list[dict] = []
+
+    for part in vision_content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text" and isinstance(part.get("text"), str):
+            tool_text = part["text"] or tool_text
+        elif part.get("type") == "image_url":
+            image_parts.append(part)
+
+    if not image_parts:
+        return tool_text, None
+
+    user_content = [
+        {
+            "type": "text",
+            "text": (
+                f"Screenshot from the previous `{tool_name}` tool result. "
+                "Use this image as the current visual browser/desktop state."
+            ),
+        },
+        *image_parts,
+    ]
+    return tool_text, LLMMessage(role="user", content=user_content)
+
+
 async def _process_tool_call(
     tc: dict,
     api_messages: list,
@@ -456,7 +489,8 @@ async def _process_tool_call(
     )
 
     # ── Vision injection for screenshot tools ──
-    tool_content: str | list = str(result)
+    tool_content = str(result)
+    vision_user_message: LLMMessage | None = None
     if supports_vision and agent_id:
         try:
             from app.services.vision_inject import try_inject_screenshot_vision
@@ -464,7 +498,11 @@ async def _process_tool_call(
             ws_path = Path(settings.STORAGE_LOCAL_ROOT or settings.AGENT_DATA_DIR) / str(agent_id)
             vision_content = try_inject_screenshot_vision(tool_name, str(result), ws_path)
             if vision_content:
-                tool_content = vision_content
+                tool_content, vision_user_message = _split_tool_result_and_vision_message(
+                    tool_name,
+                    str(result),
+                    vision_content,
+                )
                 logger.info(f"[LLM] Injected screenshot vision for {tool_name}")
         except Exception as e:
             logger.warning(f"[LLM] Vision injection failed for {tool_name}: {e}")
@@ -488,6 +526,8 @@ async def _process_tool_call(
         tool_call_id=tc["id"],
         content=tool_content,
     ))
+    if vision_user_message:
+        api_messages.append(vision_user_message)
     return ""
 
 
