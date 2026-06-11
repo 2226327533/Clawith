@@ -1791,6 +1791,22 @@ AGENT_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "agentbay_browser_cdp_scroll",
+            "description": "在 AgentBay 浏览器当前页面中通过 Playwright/CDP mouse wheel 执行页面滑动。默认在当前 viewport 中心滚动；可传 x/y 指定滚动发生的位置。适合点击/输入后需要向下、向上或横向滚动页面；滚动后应调用 agentbay_browser_screenshot 观察新页面状态。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "direction": {"type": "string", "enum": ["up", "down", "left", "right"], "description": "滚动方向，默认 down"},
+                    "amount": {"type": "integer", "description": "滚动像素距离，默认 900，最大 5000"},
+                    "x": {"type": "integer", "description": "可选：滚动位置的 viewport x 坐标；不传则使用 viewport 中心"},
+                    "y": {"type": "integer", "description": "可选：滚动位置的 viewport y 坐标；不传则使用 viewport 中心"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "agentbay_browser_login",
             "description": "Use AgentBay's AI-driven login skill to automate complex login flows (CAPTCHAs, OTP, multi-step auth). Requires a login_config JSON with AgentBay skill credentials. Navigate to the login page and execute the login skill.",
             "parameters": {
@@ -3252,6 +3268,8 @@ async def execute_tool(
             result = await _agentbay_browser_cdp_click(agent_id, ws, arguments)
         elif tool_name == "agentbay_browser_cdp_type":
             result = await _agentbay_browser_cdp_type(agent_id, ws, arguments)
+        elif tool_name == "agentbay_browser_cdp_scroll":
+            result = await _agentbay_browser_cdp_scroll(agent_id, ws, arguments)
         elif tool_name == "agentbay_code_execute":
             result = await _agentbay_code_execute(agent_id, ws, arguments)
         elif tool_name == "agentbay_code_write_file":
@@ -11898,6 +11916,48 @@ async def _agentbay_browser_cdp_type(agent_id: Optional[uuid.UUID], ws: Path, ar
     except Exception as e:
         logger.exception("[AgentBay] Browser CDP type failed")
         return f"❌ CDP 输入失败: {str(e)[:200]}"
+
+
+async def _agentbay_browser_cdp_scroll(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:
+    """AgentBay 浏览器 CDP 滑动。"""
+    if not agent_id:
+        return "❌ AgentBay 工具需要 agent 上下文"
+
+    from app.services.agentbay_client import get_agentbay_client_for_agent
+
+    direction = str(arguments.get("direction") or "down").strip().lower()
+    amount = arguments.get("amount", 900)
+    x = arguments.get("x")
+    y = arguments.get("y")
+
+    try:
+        _session_id = arguments.pop("_session_id", "")
+        client = await get_agentbay_client_for_agent(agent_id, "browser", session_id=_session_id)
+        result = await client.browser_cdp_scroll(direction=direction, amount=amount, x=x, y=y)
+        if not result.get("success"):
+            return f"❌ CDP 滑动失败: {result.get('error', 'unknown error')}"
+
+        cdp_result = result.get("cdp_result", {}) or {}
+        scroll = cdp_result.get("scroll") or {}
+        scroll_text = ""
+        if isinstance(scroll, dict):
+            scroll_text = (
+                f"\nscroll=({scroll.get('x', 0)}, {scroll.get('y', 0)}) "
+                f"page=({scroll.get('width', '?')}x{scroll.get('height', '?')}) "
+                f"viewport=({scroll.get('viewportWidth', '?')}x{scroll.get('viewportHeight', '?')})"
+            )
+        return (
+            f"✅ CDP 滑动完成: direction={result.get('direction')} amount={result.get('amount')}\n"
+            f"point=({cdp_result.get('x', '')}, {cdp_result.get('y', '')})\n"
+            f"url={cdp_result.get('url', '')}"
+            f"{scroll_text}\n"
+            "请调用 agentbay_browser_screenshot 观察滚动后的页面状态。"
+        )
+    except RuntimeError as e:
+        return f"❌ {str(e)}"
+    except Exception as e:
+        logger.exception("[AgentBay] Browser CDP scroll failed")
+        return f"❌ CDP 滑动失败: {str(e)[:200]}"
 
 
 async def _agentbay_code_execute(agent_id: Optional[uuid.UUID], ws: Path, arguments: dict) -> str:

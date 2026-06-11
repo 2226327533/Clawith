@@ -254,6 +254,50 @@ class AgentBayClient:
         except Exception as exc:
             return {**plan, "success": False, "text": text, "replace": replace, "error": str(exc)}
 
+    async def browser_cdp_scroll(
+        self,
+        direction: str = "down",
+        amount: int = 900,
+        x: Optional[int] = None,
+        y: Optional[int] = None,
+    ) -> dict:
+        """Scroll the current browser page using Playwright/CDP mouse wheel events."""
+        await self._ensure_browser_initialized()
+        normalized_direction = (direction or "down").strip().lower()
+        if normalized_direction not in {"up", "down", "left", "right"}:
+            raise RuntimeError("direction must be one of: up, down, left, right")
+        try:
+            scroll_amount = int(amount)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("amount must be an integer pixel distance") from exc
+        scroll_amount = max(1, min(scroll_amount, 5000))
+
+        payload: dict[str, Any] = {
+            "action": "scroll",
+            "direction": normalized_direction,
+            "amount": scroll_amount,
+        }
+        if x is not None:
+            payload["x"] = int(x)
+        if y is not None:
+            payload["y"] = int(y)
+
+        try:
+            result = await self._run_browser_cdp_action(payload)
+            return {
+                "success": True,
+                "direction": normalized_direction,
+                "amount": scroll_amount,
+                "cdp_result": result,
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "direction": normalized_direction,
+                "amount": scroll_amount,
+                "error": str(exc),
+            }
+
     async def _ground_browser_target_with_gemini(
         self,
         *,
@@ -1290,30 +1334,59 @@ function decodePayload() {
     if (!context) throw new Error('No browser context found');
     const pages = context.pages();
     const page = pages[pages.length - 1] || await context.newPage();
-    const x = Number(payload.x);
-    const y = Number(payload.y);
+    const action = String(payload.action || 'click');
+    const viewport = page.viewportSize() || { width: 1920, height: 1080 };
+    const defaultX = Math.floor(viewport.width / 2);
+    const defaultY = Math.floor(viewport.height / 2);
+    const x = payload.x === undefined || payload.x === null ? defaultX : Number(payload.x);
+    const y = payload.y === undefined || payload.y === null ? defaultY : Number(payload.y);
     if (!Number.isFinite(x) || !Number.isFinite(y)) {
       throw new Error('Invalid CDP coordinates');
     }
 
-    await page.mouse.click(x, y);
-    await page.waitForTimeout(150);
+    if (action === 'scroll') {
+      const amount = Math.max(1, Math.min(Number(payload.amount || 900), 5000));
+      const direction = String(payload.direction || 'down').toLowerCase();
+      let deltaX = 0;
+      let deltaY = 0;
+      if (direction === 'down') deltaY = amount;
+      else if (direction === 'up') deltaY = -amount;
+      else if (direction === 'right') deltaX = amount;
+      else if (direction === 'left') deltaX = -amount;
+      else throw new Error(`Invalid scroll direction: ${direction}`);
+      await page.mouse.move(x, y);
+      await page.mouse.wheel(deltaX, deltaY);
+    } else {
+      await page.mouse.click(x, y);
+      await page.waitForTimeout(150);
 
-    if (payload.action === 'type') {
-      if (payload.replace !== false) {
-        await page.keyboard.press('Control+A');
-        await page.keyboard.press('Backspace');
+      if (action === 'type') {
+        if (payload.replace !== false) {
+          await page.keyboard.press('Control+A');
+          await page.keyboard.press('Backspace');
+        }
+        await page.keyboard.type(String(payload.text || ''), { delay: Number(payload.delay || 20) });
       }
-      await page.keyboard.type(String(payload.text || ''), { delay: Number(payload.delay || 20) });
     }
 
     await page.waitForTimeout(300);
     const title = await page.title().catch(() => '');
+    const scrollPosition = await page.evaluate(() => ({
+      x: window.scrollX,
+      y: window.scrollY,
+      width: document.documentElement.scrollWidth,
+      height: document.documentElement.scrollHeight,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight
+    })).catch(() => null);
     process.stdout.write(JSON.stringify({
       success: true,
-      action: payload.action,
+      action,
       x,
       y,
+      direction: payload.direction,
+      amount: payload.amount,
+      scroll: scrollPosition,
       url: page.url(),
       title
     }) + '\n');

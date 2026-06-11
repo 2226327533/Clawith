@@ -25,6 +25,7 @@ SYNC_IS_DEFAULT_TOOL_NAMES = {
     "agentbay_browser_type",
     "agentbay_browser_cdp_click",
     "agentbay_browser_cdp_type",
+    "agentbay_browser_cdp_scroll",
     "agentbay_browser_extract",
     "agentbay_browser_observe",
     "agentbay_browser_login",
@@ -2649,6 +2650,25 @@ AGENTBAY_TOOLS = [
         },
     },
     {
+        "name": "agentbay_browser_cdp_scroll",
+        "display_name": "AgentBay: Browser CDP Scroll",
+        "description": "[ENV: Browser] Scroll the current AgentBay browser page through Playwright/CDP mouse wheel events. Defaults to scrolling at the viewport center; optional x/y target a specific viewport coordinate. Use this after navigate/click/type when page content is below, above, or horizontally off-screen, then call agentbay_browser_screenshot to observe the new page state. This is deterministic CDP control, not AgentBay BrowserOperator act().",
+        "category": "agentbay",
+        "icon": "◎",
+        "is_default": False,
+        "parameters_schema": {
+            "type": "object",
+            "properties": {
+                "direction": {"type": "string", "enum": ["up", "down", "left", "right"], "description": "Scroll direction. Defaults to down."},
+                "amount": {"type": "integer", "description": "Scroll distance in pixels. Defaults to 900, capped at 5000."},
+                "x": {"type": "integer", "description": "Optional viewport x coordinate where the wheel event should occur; defaults to viewport center."},
+                "y": {"type": "integer", "description": "Optional viewport y coordinate where the wheel event should occur; defaults to viewport center."},
+            },
+        },
+        "config": {},
+        "config_schema": {"fields": []},
+    },
+    {
         "name": "agentbay_code_execute",
         "display_name": "AgentBay: Code Execute",
         "description": "[ENV: Code Sandbox] Execute code (Python, Bash, Node.js) in the AgentBay Code Sandbox. IMPORTANT: This sandbox is an ISOLATED environment — it does NOT share filesystem, processes, or network with the Headless Browser (browser_* tools) or Cloud Desktop (computer_* tools). Files created here are NOT accessible from other environments.",
@@ -3641,6 +3661,7 @@ async def seed_builtin_tools():
             "agentbay_browser_save_screenshot",
             "agentbay_browser_cdp_click",
             "agentbay_browser_cdp_type",
+            "agentbay_browser_cdp_scroll",
         ]
         browser_anchor_tools_r = await db.execute(select(Tool.id).where(Tool.name.in_(browser_anchor_names)))
         browser_anchor_tool_ids = [row[0] for row in browser_anchor_tools_r.fetchall()]
